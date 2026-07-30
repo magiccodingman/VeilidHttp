@@ -221,9 +221,10 @@ impl CompletionStore {
         let evicted = self.enforce_completed_limit_locked(&mut entries, id);
         drop(entries);
         if let Some(notify) = notify {
-            notify.notify_waiters();
+            // notify_one stores a permit when the duplicate has not begun waiting yet.
+            notify.notify_one();
         }
-        self.capacity_notify.notify_waiters();
+        self.capacity_notify.notify_one();
         persist_entry(&self.directory, id, response.as_ref(), expires_at)?;
         for evicted_id in evicted {
             let _ = fs::remove_file(self.file_path(evicted_id));
@@ -238,9 +239,9 @@ impl CompletionStore {
             _ => None,
         };
         if let Some(notify) = notify {
-            notify.notify_waiters();
+            notify.notify_one();
         }
-        self.capacity_notify.notify_waiters();
+        self.capacity_notify.notify_one();
     }
 
     fn prune_locked(&self, entries: &mut HashMap<[u8; 16], Entry>) {
@@ -465,9 +466,43 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(store.claim([1; 16]).await, CompletionClaim::Execute));
-        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Wait(_)));
+        let waiting = match store.claim([2; 16]).await {
+            CompletionClaim::Wait(notify) => notify,
+            other => panic!("expected capacity wait, got {other:?}"),
+        };
         store.abandon([1; 16]).await;
+        tokio::time::timeout(Duration::from_millis(50), waiting.notified())
+            .await
+            .expect("stored capacity wake permit");
         assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Execute));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_waiter_cannot_miss_completion_wakeup() {
+        let directory = temporary_directory("duplicate-wakeup");
+        let _ = fs::remove_dir_all(&directory);
+        let id = [3_u8; 16];
+        let store = CompletionStore::open(
+            directory.clone(),
+            Duration::from_secs(60),
+            1024,
+            16,
+        )
+        .unwrap();
+        assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
+        let waiting = match store.claim(id).await {
+            CompletionClaim::Wait(notify) => notify,
+            other => panic!("expected duplicate wait, got {other:?}"),
+        };
+        store
+            .record(id, Some(Bytes::from_static(b"done")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(50), waiting.notified())
+            .await
+            .expect("stored duplicate wake permit");
+        assert!(matches!(store.claim(id).await, CompletionClaim::Replay(_)));
         fs::remove_dir_all(directory).unwrap();
     }
 }
