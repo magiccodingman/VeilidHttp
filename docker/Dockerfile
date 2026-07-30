@@ -22,7 +22,7 @@ ENV VEILID_RELEASE_CHANNEL=${VEILID_RELEASE_CHANNEL} \
 # Veilid is selected at image-build time. The running container never performs apt
 # updates; a newer Veilid version requires a tested image rebuild and normal rollout.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg tini procps \
+      ca-certificates curl gnupg tini procps netcat-openbsd \
     && curl -fsSL https://packages.veilid.net/gpg/veilid-packages-key.public \
       | gpg --dearmor -o /usr/share/keyrings/veilid-packages-keyring.gpg \
     && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
