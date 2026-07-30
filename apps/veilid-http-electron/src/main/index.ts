@@ -59,10 +59,11 @@ function registerSiteProtocol(targetSession: Session): void {
         status: number;
         headers: Array<[string, string]>;
       }>('httpRequest', {
-        siteId: url.hostname,
+        site_id: url.hostname,
         method: request.method,
-        pathAndQuery: `${url.pathname}${url.search}`,
+        path_and_query: `${url.pathname}${url.search}`,
         headers: [...request.headers.entries()],
+        has_body: request.body !== null,
       }, request.body, request.signal);
       return new Response(response.body, {
         status: response.result.status,
@@ -138,7 +139,9 @@ ipcMain.handle('veilid-http:open-route', async (_event, input: unknown) => {
   const { routeBlobBase64, startPath = '/' } = input as { routeBlobBase64?: unknown; startPath?: unknown };
   if (typeof routeBlobBase64 !== 'string') throw new Error('RouteBlob must be a string');
   if (typeof startPath !== 'string') throw new Error('Start path must be a string');
-  const response = await sidecar.request<{ fingerprint: string }>('importRoute', { routeBlobBase64 });
+  const response = await sidecar.request<{ fingerprint: string }>('importRoute', {
+    route_blob_base64: routeBlobBase64,
+  });
   const result = response.result;
   if (!isSiteId(result.fingerprint)) throw new Error('Sidecar returned an invalid route fingerprint');
   await openSite(result.fingerprint, startPath);
@@ -168,7 +171,9 @@ app.whenReady().then(async () => {
   await createShell();
   const target = findLaunchTarget(process.argv.slice(1), path.dirname(process.execPath));
   if (target) {
-    const imported = await sidecar.request<{ fingerprint: string }>('importRoute', { routeBlobBase64: target.routeBlobBase64 });
+    const imported = await sidecar.request<{ fingerprint: string }>('importRoute', {
+      route_blob_base64: target.routeBlobBase64,
+    });
     await openSite(imported.result.fingerprint, target.startPath);
   }
 });
