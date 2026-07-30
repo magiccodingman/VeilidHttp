@@ -53,7 +53,7 @@ pub enum FrameType {
 impl TryFrom<u8> for FrameType {
     type Error = WireError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self, WireError> {
         match value {
             1 => Ok(Self::Negotiate),
             2 => Ok(Self::RequestOpen),
@@ -126,7 +126,10 @@ impl FrameBundle {
             + self.frames.len() * 4
             + self.frames.iter().map(Bytes::len).sum::<usize>();
         if total > VEILID_MESSAGE_LIMIT {
-            return Err(WireError::FrameTooLarge { actual: total, limit: VEILID_MESSAGE_LIMIT });
+            return Err(WireError::FrameTooLarge {
+                actual: total,
+                limit: VEILID_MESSAGE_LIMIT,
+            });
         }
         let count = u16::try_from(self.frames.len()).map_err(|_| WireError::BundleCount)?;
         let mut output = BytesMut::with_capacity(total);
@@ -149,7 +152,10 @@ impl FrameBundle {
             return Err(WireError::TruncatedBundle);
         }
         if input.len() > VEILID_MESSAGE_LIMIT {
-            return Err(WireError::FrameTooLarge { actual: input.len(), limit: VEILID_MESSAGE_LIMIT });
+            return Err(WireError::FrameTooLarge {
+                actual: input.len(),
+                limit: VEILID_MESSAGE_LIMIT,
+            });
         }
         let mut cursor = input.clone();
         let mut magic = [0_u8; 4];
@@ -173,7 +179,9 @@ impl FrameBundle {
         for _ in 0..count {
             lengths.push(cursor.get_u32() as usize);
         }
-        let expected = lengths.iter().try_fold(0_usize, |sum, length| sum.checked_add(*length))
+        let expected = lengths
+            .iter()
+            .try_fold(0_usize, |sum, length| sum.checked_add(*length))
             .ok_or(WireError::BundleLength)?;
         if cursor.remaining() != expected {
             return Err(WireError::LengthMismatch);
@@ -187,6 +195,7 @@ impl FrameBundle {
         Ok(Self { frames })
     }
 }
+
 /// Wire-format failures.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
@@ -225,7 +234,12 @@ pub enum WireError {
     MetadataTooLarge(usize),
     /// Complete frame exceeds the configured bound.
     #[error("frame length {actual} exceeds limit {limit}")]
-    FrameTooLarge { actual: usize, limit: usize },
+    FrameTooLarge {
+        /// Actual encoded frame length.
+        actual: usize,
+        /// Configured or transport frame limit.
+        limit: usize,
+    },
     /// Declared and actual frame lengths differ.
     #[error("declared frame length does not match available bytes")]
     LengthMismatch,
@@ -252,9 +266,17 @@ impl Frame {
         }
         let total = HEADER_LEN + metadata.len() + self.payload.len();
         if total > limit.min(VEILID_MESSAGE_LIMIT) {
-            return Err(WireError::FrameTooLarge { actual: total, limit });
+            return Err(WireError::FrameTooLarge {
+                actual: total,
+                limit,
+            });
         }
 
+        let metadata_len = u16::try_from(metadata.len()).map_err(|_| WireError::MetadataTooLarge(metadata.len()))?;
+        let payload_len = u32::try_from(self.payload.len()).map_err(|_| WireError::FrameTooLarge {
+            actual: total,
+            limit,
+        })?;
         let mut output = BytesMut::with_capacity(total);
         output.put_slice(&MAGIC);
         output.put_u8(VERSION);
@@ -263,9 +285,9 @@ impl Frame {
         output.put_slice(&self.transaction_id);
         output.put_u32(self.sequence);
         output.put_u32(self.cumulative_ack);
-        output.put_u16(metadata.len() as u16);
+        output.put_u16(metadata_len);
         output.put_u16(0);
-        output.put_u32(self.payload.len() as u32);
+        output.put_u32(payload_len);
         output.put_slice(&metadata);
         output.put_slice(&self.payload);
         Ok(output.freeze())
@@ -364,26 +386,41 @@ mod tests {
         };
         let mut encoded = frame.encode().expect("encode").to_vec();
         encoded.push(0);
-        assert_eq!(Frame::decode(Bytes::from(encoded)), Err(WireError::LengthMismatch));
+        assert_eq!(
+            Frame::decode(Bytes::from(encoded)),
+            Err(WireError::LengthMismatch)
+        );
     }
 
     #[test]
     fn bundle_round_trip_keeps_transactions_independent() {
-        let make = |id: u8, payload: &'static [u8]| Frame {
-            frame_type: FrameType::RequestData,
-            flags: 0,
-            transaction_id: [id; 16],
-            sequence: 0,
-            cumulative_ack: 0,
-            metadata: Metadata::default(),
-            payload: Bytes::from_static(payload),
-        }.encode().unwrap();
-        let bundle = FrameBundle { frames: vec![make(1, b"a"), make(2, b"b")] };
+        let make = |id: u8, payload: &'static [u8]| {
+            Frame {
+                frame_type: FrameType::RequestData,
+                flags: 0,
+                transaction_id: [id; 16],
+                sequence: 0,
+                cumulative_ack: 0,
+                metadata: Metadata::default(),
+                payload: Bytes::from_static(payload),
+            }
+            .encode()
+            .unwrap()
+        };
+        let bundle = FrameBundle {
+            frames: vec![make(1, b"a"), make(2, b"b")],
+        };
         let encoded = bundle.encode().unwrap();
         let decoded = FrameBundle::decode(encoded).unwrap();
         assert_eq!(decoded, bundle);
-        assert_ne!(Frame::decode(decoded.frames[0].clone()).unwrap().transaction_id,
-                   Frame::decode(decoded.frames[1].clone()).unwrap().transaction_id);
+        assert_ne!(
+            Frame::decode(decoded.frames[0].clone())
+                .unwrap()
+                .transaction_id,
+            Frame::decode(decoded.frames[1].clone())
+                .unwrap()
+                .transaction_id
+        );
     }
 
     #[test]
@@ -397,6 +434,9 @@ mod tests {
             metadata: Metadata::default(),
             payload: Bytes::from(vec![0; DEFAULT_FRAME_LIMIT]),
         };
-        assert!(matches!(frame.encode(), Err(WireError::FrameTooLarge { .. })));
+        assert!(matches!(
+            frame.encode(),
+            Err(WireError::FrameTooLarge { .. })
+        ));
     }
 }
