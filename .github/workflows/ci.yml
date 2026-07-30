@@ -13,6 +13,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CI_REVISION: 4
+
 jobs:
   rust:
     runs-on: ubuntu-latest
