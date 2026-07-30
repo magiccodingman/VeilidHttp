@@ -13,6 +13,9 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify};
 
+/// Default number of HTTP transactions allowed to execute concurrently in the bridge.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 128;
+
 /// Result of claiming a transaction identifier.
 #[derive(Debug)]
 pub enum CompletionClaim {
@@ -22,10 +25,8 @@ pub enum CompletionClaim {
     Replay(Bytes),
     /// The transaction completed but its response was intentionally not retained.
     Tombstone,
-    /// Another task is executing the transaction; wait and claim again after notification.
+    /// Another execution or the global capacity bound must change before retrying.
     Wait(Arc<Notify>),
-    /// The process-wide active transaction limit is currently exhausted.
-    Capacity,
 }
 
 /// Existing completed state used by streamed opening deduplication.
@@ -65,16 +66,37 @@ pub struct CompletionStore {
     max_response_bytes: usize,
     max_completed_entries: usize,
     max_in_flight: usize,
+    capacity_notify: Arc<Notify>,
     entries: Mutex<HashMap<[u8; 16], Entry>>,
 }
 
 impl CompletionStore {
-    /// Open a completion directory and recover unexpired tombstones/responses.
+    /// Open a completion directory with the default active transaction limit.
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be created or enumerated.
     pub fn open(
+        directory: PathBuf,
+        retention: Duration,
+        max_response_bytes: usize,
+        max_completed_entries: usize,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_active_limit(
+            directory,
+            retention,
+            max_response_bytes,
+            max_completed_entries,
+            DEFAULT_MAX_IN_FLIGHT,
+        )
+    }
+
+    /// Open a completion directory with an explicit process-wide execution limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be created or enumerated.
+    pub fn open_with_active_limit(
         directory: PathBuf,
         retention: Duration,
         max_response_bytes: usize,
@@ -128,11 +150,12 @@ impl CompletionStore {
             max_response_bytes,
             max_completed_entries: max_completed_entries.max(1),
             max_in_flight: max_in_flight.max(1),
+            capacity_notify: Arc::new(Notify::new()),
             entries: Mutex::new(entries),
         }))
     }
 
-    /// Claim a transaction for execution, replay, waiting, or capacity rejection.
+    /// Claim a transaction for execution, replay, or waiting.
     pub async fn claim(&self, id: [u8; 16]) -> CompletionClaim {
         let mut entries = self.entries.lock().await;
         self.prune_locked(&mut entries);
@@ -149,7 +172,7 @@ impl CompletionStore {
                     .filter(|entry| matches!(entry, Entry::InFlight(_)))
                     .count();
                 if active >= self.max_in_flight {
-                    return CompletionClaim::Capacity;
+                    return CompletionClaim::Wait(Arc::clone(&self.capacity_notify));
                 }
                 entries.insert(id, Entry::InFlight(Arc::new(Notify::new())));
                 CompletionClaim::Execute
@@ -171,7 +194,7 @@ impl CompletionStore {
         })
     }
 
-    /// Record completion and wake duplicate waiters.
+    /// Record completion and wake duplicate/capacity waiters.
     ///
     /// Responses larger than the configured retention threshold become tombstones.
     /// In-memory protection is established before disk persistence is attempted.
@@ -200,6 +223,7 @@ impl CompletionStore {
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
+        self.capacity_notify.notify_waiters();
         persist_entry(&self.directory, id, response.as_ref(), expires_at)?;
         for evicted_id in evicted {
             let _ = fs::remove_file(self.file_path(evicted_id));
@@ -216,6 +240,7 @@ impl CompletionStore {
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
+        self.capacity_notify.notify_waiters();
     }
 
     fn prune_locked(&self, entries: &mut HashMap<[u8; 16], Entry>) {
@@ -381,7 +406,6 @@ mod tests {
             Duration::from_secs(60),
             1024,
             16,
-            4,
         )
         .unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
@@ -395,7 +419,6 @@ mod tests {
             Duration::from_secs(60),
             1024,
             16,
-            4,
         )
         .unwrap();
         assert!(matches!(
@@ -415,7 +438,6 @@ mod tests {
             Duration::from_secs(60),
             4,
             16,
-            4,
         )
         .unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
@@ -434,7 +456,7 @@ mod tests {
     async fn active_capacity_never_evicts_live_execution() {
         let directory = temporary_directory("capacity");
         let _ = fs::remove_dir_all(&directory);
-        let store = CompletionStore::open(
+        let store = CompletionStore::open_with_active_limit(
             directory.clone(),
             Duration::from_secs(60),
             1024,
@@ -443,7 +465,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(store.claim([1; 16]).await, CompletionClaim::Execute));
-        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Capacity));
+        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Wait(_)));
         store.abandon([1; 16]).await;
         assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Execute));
         fs::remove_dir_all(directory).unwrap();
