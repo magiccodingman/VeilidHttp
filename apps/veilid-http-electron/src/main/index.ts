@@ -80,7 +80,7 @@ function registerSiteProtocol(targetSession: Session): void {
 
 function resizeSiteView(): void {
   if (!shellWindow || !siteView) return;
-  const [width, height] = shellWindow.getContentSize();
+  const [width = 0, height = 0] = shellWindow.getContentSize();
   siteView.setBounds({ x: 0, y: SHELL_HEIGHT, width, height: Math.max(0, height - SHELL_HEIGHT) });
 }
 
