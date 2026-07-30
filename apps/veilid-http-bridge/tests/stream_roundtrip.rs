@@ -19,7 +19,7 @@ use veilid_http_bridge::{
     streaming::{StreamingBridge, StreamingConfig},
 };
 use veilid_http_engine::InboundBody;
-use veilid_http_http::{RequestHead, HeaderField};
+use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_stream::{
     CompressionMode, DecodedFrame, RequestOpen, StreamDirection, decode, encode_ack,
     encode_request_open,
@@ -39,11 +39,14 @@ struct MockTransport {
 #[async_trait]
 impl VeilidTransport for MockTransport {
     async fn import_route(&self, route_blob: Bytes) -> Result<RouteTarget, TransportError> {
+        let key = route_blob.to_vec();
         let mut imports = self.imports.lock().await;
-        Ok(imports
-            .entry(route_blob.to_vec())
-            .or_insert_with(|| RouteTarget(format!("imported-{}", imports.len())))
-            .clone())
+        if let Some(target) = imports.get(&key) {
+            return Ok(target.clone());
+        }
+        let target = RouteTarget(format!("imported-{}", imports.len()));
+        imports.insert(key, target.clone());
+        Ok(target)
     }
 
     async fn allocate_route(&self) -> Result<(RouteTarget, Bytes), TransportError> {
