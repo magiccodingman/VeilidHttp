@@ -6,6 +6,8 @@ members = [
   "crates/veilid-http-transport",
   "crates/veilid-http-http",
   "crates/veilid-http-route",
+  "crates/veilid-http-ipc",
+  "crates/veilid-http-veilid-native",
   "apps/veilid-http-native",
   "apps/veilid-http-bridge",
   "apps/veilid-http-cli",
