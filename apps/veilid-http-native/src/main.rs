@@ -1,8 +1,11 @@
 //! Trusted Electron sidecar: native Veilid transport plus bounded local IPC.
 
+mod runtime;
+
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
+use runtime::ClientRuntime;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -12,13 +15,11 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
-use veilid_http_http::{
-    HeaderField, RequestHead, decode_atomic_response, encode_atomic_request,
-};
+use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_ipc::{FrameKind, Hello, IpcFrame, read_frame, write_frame};
-use veilid_http_transport::{RouteTarget, VeilidTransport};
+use veilid_http_transport::RouteTarget;
 use veilid_http_veilid_native::{NativeTransportConfig, NativeVeilidTransport};
 
 #[derive(Debug, Parser)]
@@ -80,7 +81,7 @@ struct HttpResponseMetadata {
 
 struct State {
     data_dir: PathBuf,
-    transport: Arc<NativeVeilidTransport>,
+    runtime: Arc<ClientRuntime>,
     imported_routes: Mutex<HashMap<String, RouteTarget>>,
 }
 
@@ -119,11 +120,7 @@ fn failure(error: impl std::fmt::Display) -> Response<serde_json::Value> {
 impl State {
     async fn import_route(&self, blob: Bytes) -> Result<(String, RouteTarget)> {
         let fingerprint = persist_route(&self.data_dir, &blob)?;
-        let target = self
-            .transport
-            .import_route(blob)
-            .await
-            .context("import private RouteBlob into native Veilid node")?;
+        let target = self.runtime.import_route(blob).await?;
         self.imported_routes
             .lock()
             .await
@@ -160,7 +157,9 @@ impl State {
                         "service-worker",
                         "indexed-db",
                         "route-registry",
+                        "private-return-route",
                         "vhttp-atomic",
+                        "vhttp-streaming",
                         "binary-ipc",
                     ],
                 })?,
@@ -190,24 +189,21 @@ impl State {
                     bail!("invalid site identifier");
                 }
                 let target = self.target_for_site(&site_id).await?;
-                let transaction_id = rand::random::<[u8; 16]>();
-                let request_head = RequestHead {
-                    method,
-                    path_and_query,
-                    headers: headers
-                        .into_iter()
-                        .map(|(name, value)| HeaderField { name, value })
-                        .collect(),
-                };
-                let frame = encode_atomic_request(transaction_id, request_head, &payload, true)
-                    .context("encode atomic VHTTP request")?;
-                let reply = self
-                    .transport
-                    .app_call(&target, frame)
-                    .await
-                    .context("send VHTTP AppCall")?;
-                let response = decode_atomic_response(reply, transaction_id, 8 * 1024 * 1024)
-                    .context("decode atomic VHTTP response")?;
+                let response = self
+                    .runtime
+                    .request_buffered(
+                        &target,
+                        RequestHead {
+                            method,
+                            path_and_query,
+                            headers: headers
+                                .into_iter()
+                                .map(|(name, value)| HeaderField { name, value })
+                                .collect(),
+                        },
+                        payload,
+                    )
+                    .await?;
                 let metadata = HttpResponseMetadata {
                     status: response.head.status,
                     headers: response
@@ -223,9 +219,20 @@ impl State {
     }
 }
 
+fn secrets_equal(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
 async fn serve_connection<S>(stream: S, state: Arc<State>, expected_secret: &str) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let hello = read_frame(&mut reader).await.context("read IPC hello")?;
@@ -233,16 +240,26 @@ where
         bail!("first IPC frame must authenticate the Electron parent");
     }
     let supplied = hello.decode_metadata::<Hello>().context("decode IPC hello")?;
-    if supplied.secret.as_bytes() != expected_secret.as_bytes() {
+    if !secrets_equal(&supplied.secret, expected_secret) {
         bail!("invalid IPC launch secret");
     }
-    let accepted = IpcFrame::from_metadata(
-        FrameKind::Response,
-        hello.request_id,
-        &success(serde_json::json!({ "status": "ready" }))?,
-        Bytes::new(),
-    )?;
-    write_frame(&mut writer, &accepted).await?;
+
+    let (outbound, mut outbound_receiver) = mpsc::channel::<IpcFrame>(256);
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = outbound_receiver.recv().await {
+            write_frame(&mut writer, &frame).await?;
+        }
+        Ok::<(), veilid_http_ipc::IpcError>(())
+    });
+    outbound
+        .send(IpcFrame::from_metadata(
+            FrameKind::Response,
+            hello.request_id,
+            &success(serde_json::json!({ "status": "ready" }))?,
+            Bytes::new(),
+        )?)
+        .await
+        .context("queue IPC hello reply")?;
 
     loop {
         let frame = match read_frame(&mut reader).await {
@@ -255,45 +272,71 @@ where
                         | std::io::ErrorKind::BrokenPipe
                 ) =>
             {
-                return Ok(());
+                break;
             }
             Err(error) => return Err(error.into()),
         };
         if frame.kind != FrameKind::Request {
-            let response = IpcFrame::from_metadata(
-                FrameKind::Response,
-                frame.request_id,
-                &failure("unexpected IPC frame kind"),
-                Bytes::new(),
-            )?;
-            write_frame(&mut writer, &response).await?;
+            outbound
+                .send(IpcFrame::from_metadata(
+                    FrameKind::Response,
+                    frame.request_id,
+                    &failure("stream IPC continuation is not valid before a matching request"),
+                    Bytes::new(),
+                )?)
+                .await
+                .context("queue unexpected-frame response")?;
             continue;
         }
+
         let request = match frame.decode_metadata::<Request>() {
             Ok(request) => request,
             Err(error) => {
-                let response = IpcFrame::from_metadata(
-                    FrameKind::Response,
-                    frame.request_id,
-                    &failure(error),
-                    Bytes::new(),
-                )?;
-                write_frame(&mut writer, &response).await?;
+                outbound
+                    .send(IpcFrame::from_metadata(
+                        FrameKind::Response,
+                        frame.request_id,
+                        &failure(error),
+                        Bytes::new(),
+                    )?)
+                    .await
+                    .context("queue malformed-request response")?;
                 continue;
             }
         };
-        let (metadata, payload) = match state.handle(request, frame.payload).await {
-            Ok(value) => value,
-            Err(error) => (failure(error), Bytes::new()),
-        };
-        let response = IpcFrame::from_metadata(
-            FrameKind::Response,
-            frame.request_id,
-            &metadata,
-            payload,
-        )?;
-        write_frame(&mut writer, &response).await?;
+        let state = Arc::clone(&state);
+        let outbound = outbound.clone();
+        tokio::spawn(async move {
+            let (metadata, payload) = match state.handle(request, frame.payload).await {
+                Ok(value) => value,
+                Err(error) => (failure(error), Bytes::new()),
+            };
+            let response = IpcFrame::from_metadata(
+                FrameKind::Response,
+                frame.request_id,
+                &metadata,
+                payload,
+            );
+            match response {
+                Ok(response) => {
+                    let _ = outbound.send(response).await;
+                }
+                Err(error) => {
+                    if let Ok(response) = IpcFrame::from_metadata(
+                        FrameKind::Response,
+                        frame.request_id,
+                        &failure(error),
+                        Bytes::new(),
+                    ) {
+                        let _ = outbound.send(response).await;
+                    }
+                }
+            }
+        });
     }
+    drop(outbound);
+    writer_task.await.context("join IPC writer")??;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -332,11 +375,17 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
 async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let mut first = true;
     loop {
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&config.ipc_path)
-            .with_context(|| format!("create named pipe {}", config.ipc_path))?;
+        let server = if first {
+            first = false;
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&config.ipc_path)
+        } else {
+            ServerOptions::new().create(&config.ipc_path)
+        }
+        .with_context(|| format!("create named pipe {}", config.ipc_path))?;
         server.connect().await.context("accept Electron named-pipe connection")?;
         if let Err(error) = serve_connection(server, Arc::clone(&state), &config.ipc_secret).await {
             tracing::warn!(%error, "Electron named-pipe connection ended with an error");
@@ -354,14 +403,19 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("create {}", config.data_dir.display()))?;
 
-    let transport = NativeVeilidTransport::start(NativeTransportConfig::client(
-        config.data_dir.join("veilid"),
-    ))
-    .await
-    .context("start native Veilid transport")?;
+    let transport = Arc::new(
+        NativeVeilidTransport::start(NativeTransportConfig::client(
+            config.data_dir.join("veilid"),
+        ))
+        .await
+        .context("start native Veilid transport")?,
+    );
+    let runtime = ClientRuntime::start(transport, config.data_dir.clone())
+        .await
+        .context("start native VHTTP client runtime")?;
     let state = Arc::new(State {
         data_dir: config.data_dir.clone(),
-        transport: Arc::new(transport),
+        runtime,
         imported_routes: Mutex::new(HashMap::new()),
     });
     serve(&config, state).await
@@ -380,5 +434,12 @@ mod tests {
         assert_eq!(first, second);
         assert!(route_path(&root, &first).is_file());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launch_secret_comparison_checks_every_byte() {
+        assert!(secrets_equal("abcdefghijklmnopqrstuvwxyz012345", "abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(!secrets_equal("abcdefghijklmnopqrstuvwxyz012345", "abcdefghijklmnopqrstuvwxyz012346"));
+        assert!(!secrets_equal("short", "longer"));
     }
 }
