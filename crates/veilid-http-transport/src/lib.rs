@@ -17,6 +17,8 @@ pub enum TransportEvent {
     AppCall { call_id: String, route: Option<RouteTarget>, payload: Bytes },
     /// A route died or was released.
     RouteChanged { route: RouteTarget, dead: bool },
+    /// The underlying Veilid node shut down.
+    Shutdown,
 }
 
 /// Errors normalized across native and remote Veilid adapters.
@@ -46,6 +48,8 @@ pub trait VeilidTransport: Send + Sync {
     async fn import_route(&self, route_blob: Bytes) -> Result<RouteTarget, TransportError>;
     /// Allocate a reliable private route and return local target plus publishable blob.
     async fn allocate_route(&self) -> Result<(RouteTarget, Bytes), TransportError>;
+    /// Release a locally allocated or remotely imported private route.
+    async fn release_route(&self, target: &RouteTarget) -> Result<(), TransportError>;
     /// Send an AppCall and await its application reply.
     async fn app_call(&self, target: &RouteTarget, payload: Bytes) -> Result<Bytes, TransportError>;
     /// Dispatch a one-way AppMessage.
