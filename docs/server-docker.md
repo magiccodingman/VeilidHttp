@@ -4,15 +4,15 @@ The server is Docker-first and intentionally deploys as exactly one container.
 
 ```text
 Debian 13.6
-├── official veilid-server
+├── official pinned veilid-server
 ├── veilid-http-bridge
 ├── veilid-http-cli
-├── Veilid-only updater
 └── tini + process supervisor
 ```
 
-The Dockerfile is designed for `linux/amd64` and `linux/arm64`. It does not launch a
-second application container, an embedded reverse proxy, or a cache.
+The Dockerfile targets `linux/amd64` and `linux/arm64`. It does not launch a second
+application container, embedded reverse proxy, cache, authentication service, or load
+balancer.
 
 ## One upstream
 
@@ -23,29 +23,30 @@ VHTTP_UPSTREAM_URL=http://host.docker.internal:8080
 ```
 
 The transported client supplies only an absolute path and query. It cannot select the
-upstream scheme, host, or port. The bridge combines that path with the configured
-base URL. To use port 80, 443, 8443, or anything else, set it here on the server.
+upstream scheme, host, or port. The bridge combines that path with the configured base
+URL. To use port 80, 443, 8443, or anything custom, set it here on the server.
 
-Point this one URL at HAProxy/NGINX/Caddy/Traefik when you need multiple services,
+Point this URL at HAProxy, NGINX, Caddy, or Traefik when you need several services,
 TLS/mTLS to another machine, authentication to the upstream, routing, or failover.
+Those tools receive normal HTTP and do not need to understand Veilid.
 
 ## Compose layering
 
-Production-shaped configuration:
+Production-shaped development image:
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-Development:
+Source-mounted development:
 
 ```bash
 docker compose -f compose.yaml -f dev-compose.yaml up --build
 ```
 
-The later development file overrides or augments the base service. Both Veilid and
-the bridge still run in the same container. Linux receives the
+The later development file overrides or augments the base service. Both Veilid and the
+bridge still run inside the same container. Linux receives the
 `host.docker.internal:host-gateway` mapping; Docker Desktop provides the hostname
 natively.
 
@@ -58,46 +59,73 @@ Two host directories are mounted:
 ./data/bridge  -> /data/bridge
 ```
 
-Veilid uses persistent protected, table, and block stores. The bridge stores its
-RouteBlob, transfer journal, retained completion state, and bounded temporary spool
-files separately.
+Veilid uses persistent protected, table, block, and route-spec stores. The bridge keeps:
+
+```text
+/data/bridge/
+├── route/
+│   ├── current.blob
+│   ├── current.base64
+│   ├── current.json
+│   └── history/
+├── completed/
+├── transfers/
+└── spool/
+```
+
+`completed/` contains retained atomic replies or tombstones used to avoid re-forwarding
+a completed transaction ID. `transfers/` and `spool/` are reserved for diagnostics and
+future crash-resume work; normal V1 transfers use bounded in-memory windows and never
+materialize a complete large object there.
 
 Never run production without persistent mounts. Recreating the container must not
-silently recreate the node identity or lose the published private route.
+silently recreate node identity, lose the published route, or erase completion records
+that protect recent non-idempotent requests.
 
 ## RouteBlob lifecycle
 
-The intended live startup sequence is:
+Live startup performs:
 
-1. Start the official `veilid-server` with its client API bound inside the container.
-2. Wait until it attaches to the network.
-3. Restore the existing private route from persistent state, or allocate a reliable
-   private route on first startup.
-4. Write the RouteBlob atomically to:
+1. Start the official `veilid-server` with its client API bound to
+   `127.0.0.1:5959` inside the container.
+2. Wait until that API accepts connections.
+3. Connect the multiplexed remote adapter and verify its version prefix.
+4. Allocate a reliable private route.
+5. Atomically publish the binary RouteBlob, Base64URL representation, metadata, and
+   history entry.
+6. Begin accepting VHTTP AppCalls and AppMessages over that private route.
+7. If Veilid reports the receiving route dead, cancel active streams, allocate a
+   replacement, and publish it atomically.
 
-```text
-/data/bridge/route/current.blob
-/data/bridge/route/current.base64
-/data/bridge/route/current.json
-```
-
-5. Calculate the 128-bit BLAKE3/Base32 fingerprint.
-6. Begin accepting VHTTP AppCalls/AppMessages over that private route.
-
-Export it with:
+Inspect/export it with:
 
 ```bash
+docker compose exec veilid-http veilid-http-cli status
 docker compose exec veilid-http veilid-http-cli route show
 docker compose exec veilid-http veilid-http-cli route export --format base64
 docker compose exec veilid-http veilid-http-cli route export --format descriptor
+docker compose exec veilid-http veilid-http-cli transfers list
 ```
 
-Do not share or configure a NodeId as the destination. VeilidHttp's transport trait
-uses private RouteIds only.
+Do not share or configure the server NodeId as the destination. VeilidHttp uses the
+published private RouteBlob. Streamed clients also supply a private return RouteBlob so
+response data and acknowledgements do not fall back to a public node target.
 
-The route allocation/restore portion is currently blocked on the unfinished remote
-adapter and is called out honestly in the startup error rather than silently falling
-back to a public NodeId.
+A rotated route creates a new RouteBlob/fingerprint. Existing clients need the new blob
+unless a future discovery/pointer layer is placed above VHTTP.
+
+## Trusted forwarding metadata
+
+Before contacting the one upstream, the bridge strips spoofed values and adds:
+
+```http
+X-Veilid-Route-Fingerprint: <current-server-route-fingerprint>
+X-Veilid-Origin: veilid://<current-server-route-fingerprint>
+```
+
+These fields are useful for logging or external proxy policy. They are transport
+metadata, not proof of user identity and not a replacement for application
+authentication.
 
 ## Backups
 
@@ -109,37 +137,33 @@ tar -C data -czf veilid-http-backup.tgz veilid bridge
 ```
 
 Restore them to the same paths before starting the replacement container. A backup
-that contains only `current.base64` is enough to share the endpoint, but not enough
-to restore the server's Veilid identity and route state.
+containing only `current.base64` is sufficient to share the current endpoint, but not
+to restore the server's Veilid identity, route state, or duplicate-suppression records.
 
-Transfer spool files are transient; preserving them can help future resumability but
-they are not a substitute for application-level storage.
+## Veilid versions and updates
 
-## Veilid updates
-
-The image defaults to:
+The server and remote API schema are pinned together at image build time:
 
 ```dotenv
-VEILID_AUTO_UPDATE=true
-VEILID_VERSION=latest
+VEILID_RELEASE_CHANNEL=stable
+VEILID_VERSION=0.5.5
+VEILID_EXPECTED_VERSION_PREFIX=0.5.5
 ```
 
-At startup and periodically, only `veilid-server` and `veilid-cli` are upgraded. When
-a new package is installed, the container exits so Docker can restart both processes
-against the same persistent stores.
+A running container never invokes `apt upgrade`. This keeps deployments reproducible
+and rollback sane. Updating Veilid means rebuilding and testing a new image, then
+recreating the container against the same persistent stores.
 
-Operators who require reproducible immutable deployments should use either:
+A future release workflow may publish tested images automatically. That release process
+is intentionally separate from this development PR.
 
-```dotenv
-VEILID_AUTO_UPDATE=false
-```
+## Memory and concurrency bounds
 
-or pin an exact package version:
+Each transaction uses a bounded send window, pending-compression budget, out-of-order
+receive budget, and bounded HTTP channels. The bridge also caps active executions.
+This means object size does not determine peak memory; configured concurrency and window
+sizes do.
 
-```dotenv
-VEILID_VERSION=<exact-debian-package-version>
-```
-
-The updater never upgrades Debian generally and never modifies VeilidHttp itself.
-Future release automation will publish tested images, but it is intentionally not in
-this initial PR.
+The bridge should reject a configuration whose complete retransmission window cannot fit
+inside `VHTTP_MAX_PENDING_BYTES`. It does not silently solve an unsafe setting by
+spooling an entire model or archive to disk.
