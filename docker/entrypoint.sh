@@ -25,6 +25,50 @@ trap terminate INT TERM EXIT
 su -s /bin/sh veilid -c "veilid-server" &
 VEILID_PID=$!
 
+# The official remote API is private to this container. Wait for the listener before
+# starting the bridge so normal cold boots do not rely on process scheduling luck.
+endpoint="${VEILID_CLIENT_ENDPOINT:-127.0.0.1:5959}"
+case "$endpoint" in
+  tcp://*) endpoint=${endpoint#tcp://} ;;
+esac
+case "$endpoint" in
+  *:*)
+    host=${endpoint%:*}
+    port=${endpoint##*:}
+    attempts=0
+    until nc -z "$host" "$port" >/dev/null 2>&1; do
+      attempts=$((attempts + 1))
+      if ! kill -0 "$VEILID_PID" 2>/dev/null; then
+        echo "veilid-server exited before its client API became ready" >&2
+        wait "$VEILID_PID" || exit $?
+        exit 1
+      fi
+      if [ "$attempts" -ge "${VEILID_CLIENT_STARTUP_ATTEMPTS:-240}" ]; then
+        echo "timed out waiting for Veilid client API at $endpoint" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
+    ;;
+  unix://*)
+    socket=${endpoint#unix://}
+    attempts=0
+    until [ -S "$socket" ]; do
+      attempts=$((attempts + 1))
+      if ! kill -0 "$VEILID_PID" 2>/dev/null; then
+        echo "veilid-server exited before its client API socket became ready" >&2
+        wait "$VEILID_PID" || exit $?
+        exit 1
+      fi
+      if [ "$attempts" -ge "${VEILID_CLIENT_STARTUP_ATTEMPTS:-240}" ]; then
+        echo "timed out waiting for Veilid client API socket $socket" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
+    ;;
+esac
+
 # Development can explicitly request the configuration-only supervisor. Production
 # always starts the real official veilid-server remote adapter.
 if [ "${VHTTP_ADAPTER_MODE:-remote}" = "validation" ]; then
