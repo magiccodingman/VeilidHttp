@@ -1,60 +1,89 @@
 # Streaming and Large Objects
 
-VHTTP is designed so a large upload or download does not need to exist as one object
-in memory or on disk at any translation point.
+VHTTP is designed so a large upload or download never has to exist as one object in
+memory or on disk at any translation point.
 
 ```text
-Chromium ReadableStream
-  ↕ bounded Electron/native IPC
-streaming Zstandard encoder/decoder
-  ↕ bounded VHTTP send/receive windows
-Veilid AppMessages
-  ↕ bounded VHTTP send/receive windows
-streaming Zstandard encoder/decoder
-  ↕ HTTP body stream
-configured upstream
+Chromium request/response ReadableStream
+  ↕ authenticated bounded binary IPC
+native VHTTP request/response channels
+  ↕ streaming Zstandard
+bounded VHTTP pending + retransmission window
+  ↕ bundled Veilid AppMessages
+bounded VHTTP reassembly + streaming Zstandard
+  ↕ bounded HTTP body channel
+one configured upstream
 ```
 
 ## Memory bound
 
-The sender retains only unacknowledged encoded frames. With a 32-frame window and
-roughly 30 KiB frames, one active direction retains around one MiB plus metadata—not
-the complete file. The receiver emits contiguous decoded bytes immediately and stores
-only bounded out-of-order frames.
+The sender owns a single byte budget covering both:
 
-A 70 GB model and a 70 MB archive follow the same memory model. Concurrency, frame
-size, compression buffers, and window sizes determine peak memory, not total object
-size.
+- Compressed payloads waiting outside the send window.
+- Complete encoded frames retained for retransmission.
+
+Construction fails unless the configured full frame window can fit inside that byte
+budget. ACK processing releases the exact encoded frame bytes. The receiver emits
+contiguous decoded bytes immediately and stores only a configured amount of compressed
+out-of-order data.
+
+With 32 frames near 30 KiB, a direction requires roughly one MiB for its complete
+retransmission window before compression and channel overhead. The default pending
+budget is eight MiB. A 70 GB model and a 70 MB archive follow the same per-transaction
+memory model; concurrency and configured windows determine peak process memory.
+
+Both the Electron sidecar and bridge cap simultaneously active transactions so a
+malicious site cannot multiply the per-transaction bounds without limit.
 
 ## Backpressure
 
 Backpressure crosses every boundary:
 
 1. Chromium stops pulling from the response `ReadableStream`.
-2. Electron stops reading response chunks from the native sidecar.
-3. The client advertises a smaller/zero receive window.
-4. The server stops advancing its send window.
-5. The bridge stops aggressively reading the upstream response body.
+2. Electron pauses the sidecar socket when its stream high-water mark is full.
+3. The native IPC writer blocks on its bounded outbound queue.
+4. The client runtime does not accept another response chunk into its bounded channel.
+5. That response frame is not acknowledged yet.
+6. The bridge's response window stops advancing.
+7. The bridge stops reading the upstream response stream aggressively.
 
-The reverse direction applies to uploads.
+Uploads apply the same logic in reverse: Node socket drain, bounded sidecar request
+channel, VHTTP send window, bounded bridge request channel, then upstream HTTP body.
 
-## Disk spooling
+## Compression and framing
 
-Disk spooling is a bounded recovery tool for out-of-order/retry state, not the normal
-way to assemble an entire object. Administrators may cap spool bytes and active
-transactions. Once a contiguous chunk is handed downstream and no longer needed for
-retry, it can be released.
+Each request direction and response direction has its own Zstandard stream. Compression
+happens before fragmentation. Unrelated HTTP transactions never share a compression
+history, retry state, or cancellation boundary.
 
-## Adaptive batching
+Tiny logical writes are coalesced into VHTTP data frames. Several complete frames—even
+from ACK handling within one incoming message—may be encoded into one Veilid transport
+bundle without exceeding the 32,768-byte Veilid message ceiling. This reduces multi-hop
+overhead while retaining independent transaction IDs and sequence spaces.
 
-Tiny writes from one stream are briefly coalesced before framing. Tiny frames from
-several streams can then be placed in one transport bundle. This reduces multi-hop
-message overhead without applying a long artificial delay or coupling unrelated Zstd
-histories.
+## Reliability
 
-## Resume semantics
+- AppCall opens a streamed transaction and returns `RequestAccepted`.
+- The opening includes a private client return RouteBlob.
+- AppMessages carry request data, response open/data/end, ACKs, errors, and cancellation.
+- Cumulative plus 64-bit selective ACKs release received frames.
+- Missing frames are retransmitted with bounded exponential delay.
+- Duplicate data frames are not emitted twice.
+- Final logical byte length and BLAKE3 digest verify decompression/reassembly.
+- AbortSignal cancellation propagates to the upstream request.
 
-V1 retains transaction IDs, ACK state, and recently completed responses long enough
-to survive ordinary retries. Full process-crash resume for arbitrary multi-gigabyte
-streams is a separate milestone because it requires durable sender and receiver
-journals. The in-memory algorithms are already structured around that future state.
+## Persistence and restart
+
+V1 deliberately does **not** spool a complete stream to disk. Restarting either endpoint
+fails in-progress transfers rather than keeping a potentially enormous hidden copy.
+Applications may retry according to their own semantics.
+
+The bridge does persist completed transaction records:
+
+- Small atomic replies may be replayed.
+- Large and streamed transactions leave tombstones.
+- A duplicate retained transaction ID is not silently forwarded upstream again.
+
+Full mid-stream crash resume would require durable sender/receiver journals and a bounded
+spool policy. That remains a separate future protocol capability rather than a hidden
+V1 promise.
