@@ -10,13 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
 };
 use veilid_http_core::RetryPolicy;
 use veilid_http_engine::{InboundBody, OutboundBody};
 use veilid_http_http::{
-    HeaderField, ResponseHead, attach_route_headers, normalize_request, upstream_url,
+    HeaderField, ResponseHead, attach_route_headers, normalize_request, strip_hop_by_hop,
+    upstream_url,
 };
 use veilid_http_stream::{
     CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen,
@@ -256,14 +257,13 @@ impl StreamingBridge {
             .await
             .insert(transaction_id, Arc::clone(&transaction));
 
-        self.transport
-            .app_call_reply(call_id, accepted_reply)
-            .await
-            .context("reply RequestAccepted")?;
-
+        let (start_sender, start_receiver) = oneshot::channel::<()>();
         let runtime = self.clone();
         let task_transaction = Arc::clone(&transaction);
         let task = tokio::spawn(async move {
+            if start_receiver.await.is_err() {
+                return;
+            }
             let result = runtime
                 .run_upstream(
                     transaction_id,
@@ -273,6 +273,7 @@ impl StreamingBridge {
                     Arc::clone(&task_transaction),
                 )
                 .await;
+            runtime.transactions.lock().await.remove(&transaction_id);
             if let Err(error) = &result {
                 tracing::error!(%error, transaction = %hex_transaction(transaction_id), "streamed HTTP transaction failed");
                 let _ = runtime
@@ -288,9 +289,21 @@ impl StreamingBridge {
             if let Err(error) = runtime.completion.record(transaction_id, None).await {
                 tracing::error!(%error, transaction = %hex_transaction(transaction_id), "failed to persist streamed completion tombstone");
             }
-            runtime.transactions.lock().await.remove(&transaction_id);
         });
         *transaction.task.lock().await = Some(task);
+
+        if let Err(error) = self
+            .transport
+            .app_call_reply(call_id, accepted_reply)
+            .await
+        {
+            if let Some(task) = transaction.task.lock().await.take() {
+                task.abort();
+            }
+            self.transactions.lock().await.remove(&transaction_id);
+            return Err(error).context("reply RequestAccepted");
+        }
+        let _ = start_sender.send(());
         Ok(())
     }
 
@@ -489,16 +502,18 @@ impl StreamingBridge {
             .context("streamed upstream request exceeded overall timeout")?
             .context("send streamed upstream request")?;
         let status = response.status().as_u16();
-        let response_headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value.to_str().ok().map(|value| HeaderField {
-                    name: name.as_str().to_owned(),
-                    value: value.to_owned(),
+        let response_headers = strip_hop_by_hop(
+            response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.to_str().ok().map(|value| HeaderField {
+                        name: name.as_str().to_owned(),
+                        value: value.to_owned(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>(),
+        );
         let response_open = ResponseOpen {
             head: ResponseHead {
                 status,
