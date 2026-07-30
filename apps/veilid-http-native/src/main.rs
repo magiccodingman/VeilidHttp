@@ -5,7 +5,7 @@ mod runtime;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
-use runtime::ClientRuntime;
+use runtime::{ClientResponseEvent, ClientRuntime};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
 };
 use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_ipc::{FrameKind, Hello, IpcFrame, read_frame, write_frame};
@@ -52,6 +52,8 @@ enum Request {
         method: String,
         path_and_query: String,
         headers: Vec<(String, String)>,
+        #[serde(default)]
+        has_body: bool,
     },
 }
 
@@ -83,6 +85,12 @@ struct State {
     data_dir: PathBuf,
     runtime: Arc<ClientRuntime>,
     imported_routes: Mutex<HashMap<String, RouteTarget>>,
+}
+
+#[derive(Debug)]
+struct ActiveRequest {
+    request_body: Option<mpsc::Sender<Bytes>>,
+    cancel: watch::Sender<bool>,
 }
 
 fn route_path(data_dir: &Path, site_id: &str) -> PathBuf {
@@ -133,7 +141,8 @@ impl State {
             return Ok(target);
         }
         let path = route_path(&self.data_dir, site_id);
-        let blob = fs::read(&path).with_context(|| format!("read imported route {}", path.display()))?;
+        let blob = fs::read(&path)
+            .with_context(|| format!("read imported route {}", path.display()))?;
         let (fingerprint, target) = self.import_route(Bytes::from(blob)).await?;
         if fingerprint != site_id {
             bail!("persisted RouteBlob fingerprint does not match requested site identifier");
@@ -141,10 +150,9 @@ impl State {
         Ok(target)
     }
 
-    async fn handle(
+    async fn handle_control(
         &self,
         request: Request,
-        payload: Bytes,
     ) -> Result<(Response<serde_json::Value>, Bytes)> {
         match request {
             Request::Health => Ok((success(serde_json::json!({ "status": "ready" }))?, Bytes::new())),
@@ -160,7 +168,7 @@ impl State {
                         "private-return-route",
                         "vhttp-atomic",
                         "vhttp-streaming",
-                        "binary-ipc",
+                        "streaming-binary-ipc",
                     ],
                 })?,
                 Bytes::new(),
@@ -179,42 +187,7 @@ impl State {
                 let (fingerprint, _) = self.import_route(Bytes::from(blob)).await?;
                 Ok((success(serde_json::json!({ "fingerprint": fingerprint }))?, Bytes::new()))
             }
-            Request::HttpRequest {
-                site_id,
-                method,
-                path_and_query,
-                headers,
-            } => {
-                if !veilid_http_route::is_site_id(&site_id) {
-                    bail!("invalid site identifier");
-                }
-                let target = self.target_for_site(&site_id).await?;
-                let response = self
-                    .runtime
-                    .request_buffered(
-                        &target,
-                        RequestHead {
-                            method,
-                            path_and_query,
-                            headers: headers
-                                .into_iter()
-                                .map(|(name, value)| HeaderField { name, value })
-                                .collect(),
-                        },
-                        payload,
-                    )
-                    .await?;
-                let metadata = HttpResponseMetadata {
-                    status: response.head.status,
-                    headers: response
-                        .head
-                        .headers
-                        .into_iter()
-                        .map(|header| (header.name, header.value))
-                        .collect(),
-                };
-                Ok((success(metadata)?, response.body))
-            }
+            Request::HttpRequest { .. } => bail!("HTTP requests use the streaming IPC path"),
         }
     }
 }
@@ -228,6 +201,139 @@ fn secrets_equal(left: &str, right: &str) -> bool {
         .zip(right.as_bytes())
         .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
         == 0
+}
+
+async fn queue_response<T: Serialize>(
+    outbound: &mpsc::Sender<IpcFrame>,
+    kind: FrameKind,
+    request_id: u64,
+    metadata: &T,
+    payload: Bytes,
+) -> Result<()> {
+    outbound
+        .send(IpcFrame::from_metadata(kind, request_id, metadata, payload)?)
+        .await
+        .context("queue IPC response")
+}
+
+async fn start_http_request(
+    state: Arc<State>,
+    outbound: mpsc::Sender<IpcFrame>,
+    active: Arc<Mutex<HashMap<u64, ActiveRequest>>>,
+    request_id: u64,
+    site_id: String,
+    method: String,
+    path_and_query: String,
+    headers: Vec<(String, String)>,
+    has_body: bool,
+) -> Result<()> {
+    if !veilid_http_route::is_site_id(&site_id) {
+        bail!("invalid site identifier");
+    }
+    if active.lock().await.contains_key(&request_id) {
+        bail!("duplicate active IPC request identifier");
+    }
+    let target = state.target_for_site(&site_id).await?;
+    let request = state.runtime.start_request(
+        target,
+        RequestHead {
+            method,
+            path_and_query,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| HeaderField { name, value })
+                .collect(),
+        },
+        has_body,
+    );
+    let cancel = request.cancellation_handle();
+    let request_body = request.request_body;
+    let mut responses = request.responses;
+    active.lock().await.insert(
+        request_id,
+        ActiveRequest {
+            request_body,
+            cancel,
+        },
+    );
+
+    tokio::spawn(async move {
+        let mut head_sent = false;
+        while let Some(event) = responses.recv().await {
+            let queued = match event {
+                ClientResponseEvent::Head(head) => {
+                    head_sent = true;
+                    let metadata = HttpResponseMetadata {
+                        status: head.status,
+                        headers: head
+                            .headers
+                            .into_iter()
+                            .map(|header| (header.name, header.value))
+                            .collect(),
+                    };
+                    queue_response(
+                        &outbound,
+                        FrameKind::Response,
+                        request_id,
+                        &success(metadata).unwrap_or_else(|error| failure(error)),
+                        Bytes::new(),
+                    )
+                    .await
+                }
+                ClientResponseEvent::Data(chunk) => {
+                    queue_response(
+                        &outbound,
+                        FrameKind::StreamData,
+                        request_id,
+                        &(),
+                        chunk,
+                    )
+                    .await
+                }
+                ClientResponseEvent::End => {
+                    let result = queue_response(
+                        &outbound,
+                        FrameKind::StreamEnd,
+                        request_id,
+                        &(),
+                        Bytes::new(),
+                    )
+                    .await;
+                    if result.is_ok() {
+                        break;
+                    }
+                    result
+                }
+                ClientResponseEvent::Error(error) => {
+                    let kind = if head_sent {
+                        FrameKind::Cancel
+                    } else {
+                        FrameKind::Response
+                    };
+                    let result = queue_response(
+                        &outbound,
+                        kind,
+                        request_id,
+                        &failure(error),
+                        Bytes::new(),
+                    )
+                    .await;
+                    if result.is_ok() {
+                        break;
+                    }
+                    result
+                }
+            };
+            if let Err(error) = queued {
+                tracing::debug!(%error, request_id, "stopped forwarding IPC response stream");
+                break;
+            }
+        }
+        if let Some(active_request) = active.lock().await.remove(&request_id) {
+            let _ = active_request.cancel.send(true);
+        }
+    });
+    Ok(())
 }
 
 async fn serve_connection<S>(stream: S, state: Arc<State>, expected_secret: &str) -> Result<()>
@@ -244,23 +350,23 @@ where
         bail!("invalid IPC launch secret");
     }
 
-    let (outbound, mut outbound_receiver) = mpsc::channel::<IpcFrame>(256);
+    let (outbound, mut outbound_receiver) = mpsc::channel::<IpcFrame>(16);
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = outbound_receiver.recv().await {
             write_frame(&mut writer, &frame).await?;
         }
         Ok::<(), veilid_http_ipc::IpcError>(())
     });
-    outbound
-        .send(IpcFrame::from_metadata(
-            FrameKind::Response,
-            hello.request_id,
-            &success(serde_json::json!({ "status": "ready" }))?,
-            Bytes::new(),
-        )?)
-        .await
-        .context("queue IPC hello reply")?;
+    queue_response(
+        &outbound,
+        FrameKind::Response,
+        hello.request_id,
+        &success(serde_json::json!({ "status": "ready" }))?,
+        Bytes::new(),
+    )
+    .await?;
 
+    let active = Arc::new(Mutex::new(HashMap::<u64, ActiveRequest>::new()));
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(frame) => frame,
@@ -276,63 +382,155 @@ where
             }
             Err(error) => return Err(error.into()),
         };
-        if frame.kind != FrameKind::Request {
-            outbound
-                .send(IpcFrame::from_metadata(
-                    FrameKind::Response,
-                    frame.request_id,
-                    &failure("stream IPC continuation is not valid before a matching request"),
-                    Bytes::new(),
-                )?)
-                .await
-                .context("queue unexpected-frame response")?;
-            continue;
-        }
 
-        let request = match frame.decode_metadata::<Request>() {
-            Ok(request) => request,
-            Err(error) => {
-                outbound
-                    .send(IpcFrame::from_metadata(
-                        FrameKind::Response,
-                        frame.request_id,
-                        &failure(error),
-                        Bytes::new(),
-                    )?)
-                    .await
-                    .context("queue malformed-request response")?;
-                continue;
-            }
-        };
-        let state = Arc::clone(&state);
-        let outbound = outbound.clone();
-        tokio::spawn(async move {
-            let (metadata, payload) = match state.handle(request, frame.payload).await {
-                Ok(value) => value,
-                Err(error) => (failure(error), Bytes::new()),
-            };
-            let response = IpcFrame::from_metadata(
-                FrameKind::Response,
-                frame.request_id,
-                &metadata,
-                payload,
-            );
-            match response {
-                Ok(response) => {
-                    let _ = outbound.send(response).await;
-                }
-                Err(error) => {
-                    if let Ok(response) = IpcFrame::from_metadata(
-                        FrameKind::Response,
-                        frame.request_id,
-                        &failure(error),
-                        Bytes::new(),
-                    ) {
-                        let _ = outbound.send(response).await;
+        match frame.kind {
+            FrameKind::Request => {
+                let request = match frame.decode_metadata::<Request>() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        queue_response(
+                            &outbound,
+                            FrameKind::Response,
+                            frame.request_id,
+                            &failure(error),
+                            Bytes::new(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                match request {
+                    Request::HttpRequest {
+                        site_id,
+                        method,
+                        path_and_query,
+                        headers,
+                        has_body,
+                    } => {
+                        if !frame.payload.is_empty() {
+                            queue_response(
+                                &outbound,
+                                FrameKind::Response,
+                                frame.request_id,
+                                &failure("HTTP request bodies must use StreamData IPC frames"),
+                                Bytes::new(),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if let Err(error) = start_http_request(
+                            Arc::clone(&state),
+                            outbound.clone(),
+                            Arc::clone(&active),
+                            frame.request_id,
+                            site_id,
+                            method,
+                            path_and_query,
+                            headers,
+                            has_body,
+                        )
+                        .await
+                        {
+                            queue_response(
+                                &outbound,
+                                FrameKind::Response,
+                                frame.request_id,
+                                &failure(error),
+                                Bytes::new(),
+                            )
+                            .await?;
+                        }
+                    }
+                    control => {
+                        let state = Arc::clone(&state);
+                        let outbound = outbound.clone();
+                        tokio::spawn(async move {
+                            let (metadata, payload) = match state.handle_control(control).await {
+                                Ok(value) => value,
+                                Err(error) => (failure(error), Bytes::new()),
+                            };
+                            let _ = queue_response(
+                                &outbound,
+                                FrameKind::Response,
+                                frame.request_id,
+                                &metadata,
+                                payload,
+                            )
+                            .await;
+                        });
                     }
                 }
             }
-        });
+            FrameKind::StreamData => {
+                let sender = active
+                    .lock()
+                    .await
+                    .get(&frame.request_id)
+                    .and_then(|request| request.request_body.clone());
+                match sender {
+                    Some(sender) => {
+                        if sender.send(frame.payload).await.is_err() {
+                            queue_response(
+                                &outbound,
+                                FrameKind::Cancel,
+                                frame.request_id,
+                                &failure("native request-body stream is closed"),
+                                Bytes::new(),
+                            )
+                            .await?;
+                        }
+                    }
+                    None => {
+                        queue_response(
+                            &outbound,
+                            FrameKind::Cancel,
+                            frame.request_id,
+                            &failure("no live request body accepts this StreamData frame"),
+                            Bytes::new(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            FrameKind::StreamEnd => {
+                let mut active_requests = active.lock().await;
+                match active_requests.get_mut(&frame.request_id) {
+                    Some(request) if request.request_body.is_some() => {
+                        request.request_body.take();
+                    }
+                    _ => {
+                        drop(active_requests);
+                        queue_response(
+                            &outbound,
+                            FrameKind::Cancel,
+                            frame.request_id,
+                            &failure("no live request body accepts this StreamEnd frame"),
+                            Bytes::new(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            FrameKind::Cancel => {
+                if let Some(request) = active.lock().await.remove(&frame.request_id) {
+                    let _ = request.cancel.send(true);
+                }
+            }
+            FrameKind::Hello | FrameKind::Response | FrameKind::Event => {
+                queue_response(
+                    &outbound,
+                    FrameKind::Response,
+                    frame.request_id,
+                    &failure("invalid IPC frame kind from Electron"),
+                    Bytes::new(),
+                )
+                .await?;
+            }
+        }
+    }
+
+    for (_, request) in active.lock().await.drain() {
+        let _ = request.cancel.send(true);
     }
     drop(outbound);
     writer_task.await.context("join IPC writer")??;
@@ -346,7 +544,8 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
 
     let path = Path::new(&config.ipc_path);
     if path.exists() {
-        fs::remove_file(path).with_context(|| format!("remove stale IPC socket {}", path.display()))?;
+        fs::remove_file(path)
+            .with_context(|| format!("remove stale IPC socket {}", path.display()))?;
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -358,7 +557,10 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
         .with_context(|| format!("protect IPC socket {}", path.display()))?;
     let result = async {
         loop {
-            let (stream, _) = listener.accept().await.context("accept Electron IPC connection")?;
+            let (stream, _) = listener
+                .accept()
+                .await
+                .context("accept Electron IPC connection")?;
             if let Err(error) = serve_connection(stream, Arc::clone(&state), &config.ipc_secret).await {
                 tracing::warn!(%error, "Electron IPC connection ended with an error");
             }
@@ -386,7 +588,10 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
             ServerOptions::new().create(&config.ipc_path)
         }
         .with_context(|| format!("create named pipe {}", config.ipc_path))?;
-        server.connect().await.context("accept Electron named-pipe connection")?;
+        server
+            .connect()
+            .await
+            .context("accept Electron named-pipe connection")?;
         if let Err(error) = serve_connection(server, Arc::clone(&state), &config.ipc_secret).await {
             tracing::warn!(%error, "Electron named-pipe connection ended with an error");
         }
@@ -395,7 +600,9 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let config = Config::parse();
     if config.ipc_secret.len() < 32 {
         bail!("VHTTP_IPC_SECRET is too short");
@@ -438,8 +645,14 @@ mod tests {
 
     #[test]
     fn launch_secret_comparison_checks_every_byte() {
-        assert!(secrets_equal("abcdefghijklmnopqrstuvwxyz012345", "abcdefghijklmnopqrstuvwxyz012345"));
-        assert!(!secrets_equal("abcdefghijklmnopqrstuvwxyz012345", "abcdefghijklmnopqrstuvwxyz012346"));
+        assert!(secrets_equal(
+            "abcdefghijklmnopqrstuvwxyz012345",
+            "abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(!secrets_equal(
+            "abcdefghijklmnopqrstuvwxyz012345",
+            "abcdefghijklmnopqrstuvwxyz012346"
+        ));
         assert!(!secrets_equal("short", "longer"));
     }
 }
