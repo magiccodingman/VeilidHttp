@@ -55,8 +55,7 @@ function registerSiteProtocol(targetSession: Session): void {
     if (!isSiteId(url.hostname)) return new Response('Invalid Veilid route identifier', { status: 400 });
 
     try {
-      const requestBody = request.body === null ? Buffer.alloc(0) : Buffer.from(await request.arrayBuffer());
-      const response = await sidecar.request<{
+      const response = await sidecar.streamRequest<{
         status: number;
         headers: Array<[string, string]>;
       }>('httpRequest', {
@@ -64,8 +63,8 @@ function registerSiteProtocol(targetSession: Session): void {
         method: request.method,
         pathAndQuery: `${url.pathname}${url.search}`,
         headers: [...request.headers.entries()],
-      }, requestBody);
-      return new Response(response.payload.length === 0 ? null : new Uint8Array(response.payload), {
+      }, request.body, request.signal);
+      return new Response(response.body, {
         status: response.result.status,
         headers: response.result.headers,
       });
