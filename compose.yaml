@@ -7,7 +7,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         VEILID_RELEASE_CHANNEL: ${VEILID_RELEASE_CHANNEL:-stable}
-        VEILID_VERSION: ${VEILID_VERSION:-latest}
+        VEILID_VERSION: ${VEILID_VERSION:-0.5.5}
     image: ghcr.io/magiccodingman/veilid-http-server:${VHTTP_IMAGE_TAG:-dev}
     container_name: veilid-http
     restart: unless-stopped
@@ -24,6 +24,7 @@ services:
       VHTTP_MAX_ATOMIC_BODY_BYTES: ${VHTTP_MAX_ATOMIC_BODY_BYTES:-8388608}
       VHTTP_ADAPTER_MODE: ${VHTTP_ADAPTER_MODE:-remote}
       VEILID_CLIENT_ENDPOINT: ${VEILID_CLIENT_ENDPOINT:-127.0.0.1:5959}
+      VEILID_EXPECTED_VERSION_PREFIX: ${VEILID_EXPECTED_VERSION_PREFIX:-0.5.5}
       RUST_LOG: ${VHTTP_LOG_LEVEL:-info}
     volumes:
       - ./data/veilid:/data/veilid
