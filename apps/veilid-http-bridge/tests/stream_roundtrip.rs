@@ -53,6 +53,10 @@ impl VeilidTransport for MockTransport {
         Err(TransportError::Fatal("not used by bridge test".to_owned()))
     }
 
+    async fn release_route(&self, _target: &RouteTarget) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     async fn app_call(
         &self,
         _target: &RouteTarget,
