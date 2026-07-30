@@ -207,9 +207,10 @@ async fn streamed_get_forwards_once_and_rejects_completed_duplicate() {
 
     let mut receiver = None;
     let mut response_body = Vec::new();
+    let mut response_completed = false;
     let deadline = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(deadline);
-    loop {
+    while !response_completed {
         tokio::select! {
             message = messages.recv() => {
                 let (_, payload) = message.expect("bridge response message");
@@ -235,15 +236,10 @@ async fn streamed_get_forwards_once_and_rejects_completed_duplicate() {
                                 response_body.extend_from_slice(&chunk);
                             }
                             bridge.handle_message(encode_ack(transaction_id, output.ack).unwrap()).await.unwrap();
-                            if output.completed {
-                                break;
-                            }
+                            response_completed = output.completed;
                         }
                         other => panic!("unexpected server frame: {other:?}"),
                     }
-                }
-                if response_body == b"streamed-response" {
-                    break;
                 }
             }
             () = &mut deadline => panic!("streamed response timed out"),
