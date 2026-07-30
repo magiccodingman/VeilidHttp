@@ -12,11 +12,12 @@ RUN cargo build --release -p veilid-http-bridge -p veilid-http-cli
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 ARG TARGETARCH
 ARG VEILID_RELEASE_CHANNEL=stable
-ARG VEILID_VERSION=latest
+ARG VEILID_VERSION=0.5.5
 LABEL org.opencontainers.image.source="https://github.com/magiccodingman/VeilidHttp"
 LABEL org.opencontainers.image.description="VeilidHttp server bridge and official veilid-server"
 ENV VEILID_RELEASE_CHANNEL=${VEILID_RELEASE_CHANNEL} \
     VEILID_VERSION=${VEILID_VERSION} \
+    VEILID_EXPECTED_VERSION_PREFIX=0.5.5 \
     VEILID_CLIENT_ENDPOINT=127.0.0.1:5959
 
 # Veilid is selected at image-build time. The running container never performs apt
@@ -28,11 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
       > /etc/apt/sources.list.d/veilid.list \
     && apt-get update \
-    && if [ "${VEILID_VERSION}" = "latest" ]; then \
-         apt-get install -y --no-install-recommends veilid-server veilid-cli; \
-       else \
-         apt-get install -y --no-install-recommends "veilid-server=${VEILID_VERSION}" "veilid-cli=${VEILID_VERSION}"; \
-       fi \
+    && apt-get install -y --no-install-recommends \
+         "veilid-server=${VEILID_VERSION}" \
+         "veilid-cli=${VEILID_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/veilid-http-bridge /usr/local/bin/
