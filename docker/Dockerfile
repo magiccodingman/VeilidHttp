@@ -13,9 +13,14 @@ FROM debian:${DEBIAN_VERSION}-slim AS runtime
 ARG TARGETARCH
 ARG VEILID_RELEASE_CHANNEL=stable
 ARG VEILID_VERSION=latest
+LABEL org.opencontainers.image.source="https://github.com/magiccodingman/VeilidHttp"
+LABEL org.opencontainers.image.description="VeilidHttp server bridge and official veilid-server"
 ENV VEILID_RELEASE_CHANNEL=${VEILID_RELEASE_CHANNEL} \
-    VEILID_VERSION=${VEILID_VERSION}
+    VEILID_VERSION=${VEILID_VERSION} \
+    VEILID_CLIENT_ENDPOINT=127.0.0.1:5959
 
+# Veilid is selected at image-build time. The running container never performs apt
+# updates; a newer Veilid version requires a tested image rebuild and normal rollout.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg tini procps \
     && curl -fsSL https://packages.veilid.net/gpg/veilid-packages-key.public \
@@ -32,15 +37,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /src/target/release/veilid-http-bridge /usr/local/bin/
 COPY --from=builder /src/target/release/veilid-http-cli /usr/local/bin/
-COPY docker/entrypoint.sh docker/healthcheck.sh docker/update-veilid.sh /usr/local/bin/
+COPY docker/entrypoint.sh docker/healthcheck.sh /usr/local/bin/
 COPY docker/veilid-server.conf /etc/veilid-server/veilid-server.conf
 
 RUN install -d -o veilid -g veilid \
       /data/veilid/protected-store \
       /data/veilid/table-store \
       /data/veilid/block-store \
-      /data/bridge \
-    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh /usr/local/bin/update-veilid.sh
+      /data/bridge/route/history \
+      /data/bridge/transfers \
+      /data/bridge/completed \
+      /data/bridge/spool \
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 
 VOLUME ["/data/veilid", "/data/bridge"]
 EXPOSE 5150/tcp 5150/udp
