@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
 use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_ipc::{FrameKind, Hello, IpcFrame, read_frame, write_frame};
@@ -34,6 +34,9 @@ struct Config {
     /// Random launch secret supplied only through the child-process environment.
     #[arg(long, env = "VHTTP_IPC_SECRET", hide_env_values = true)]
     ipc_secret: String,
+    /// Process-wide limit for simultaneously active browser HTTP requests.
+    #[arg(long, env = "VHTTP_CLIENT_MAX_ACTIVE_REQUESTS", default_value_t = 64)]
+    max_active_requests: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,12 +88,14 @@ struct State {
     data_dir: PathBuf,
     runtime: Arc<ClientRuntime>,
     imported_routes: Mutex<HashMap<String, RouteTarget>>,
+    active_requests: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
 struct ActiveRequest {
     request_body: Option<mpsc::Sender<Bytes>>,
     cancel: watch::Sender<bool>,
+    _permit: OwnedSemaphorePermit,
 }
 
 fn route_path(data_dir: &Path, site_id: &str) -> PathBuf {
@@ -216,6 +221,7 @@ async fn queue_response<T: Serialize>(
         .context("queue IPC response")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_http_request(
     state: Arc<State>,
     outbound: mpsc::Sender<IpcFrame>,
@@ -233,6 +239,9 @@ async fn start_http_request(
     if active.lock().await.contains_key(&request_id) {
         bail!("duplicate active IPC request identifier");
     }
+    let permit = Arc::clone(&state.active_requests)
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("client active request limit reached"))?;
     let target = state.target_for_site(&site_id).await?;
     let request = state.runtime.start_request(
         target,
@@ -254,6 +263,7 @@ async fn start_http_request(
         ActiveRequest {
             request_body,
             cancel,
+            _permit: permit,
         },
     );
 
@@ -607,6 +617,9 @@ async fn main() -> Result<()> {
     if config.ipc_secret.len() < 32 {
         bail!("VHTTP_IPC_SECRET is too short");
     }
+    if config.max_active_requests == 0 {
+        bail!("VHTTP_CLIENT_MAX_ACTIVE_REQUESTS must be non-zero");
+    }
     fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("create {}", config.data_dir.display()))?;
 
@@ -624,6 +637,7 @@ async fn main() -> Result<()> {
         data_dir: config.data_dir.clone(),
         runtime,
         imported_routes: Mutex::new(HashMap::new()),
+        active_requests: Arc::new(Semaphore::new(config.max_active_requests)),
     });
     serve(&config, state).await
 }
