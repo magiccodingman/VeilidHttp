@@ -20,8 +20,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 veilid-http-core = { path = "../../crates/veilid-http-core" }
+veilid-http-engine = { path = "../../crates/veilid-http-engine" }
 veilid-http-http = { path = "../../crates/veilid-http-http" }
 veilid-http-route = { path = "../../crates/veilid-http-route" }
+veilid-http-stream = { path = "../../crates/veilid-http-stream" }
 veilid-http-transport = { path = "../../crates/veilid-http-transport" }
 veilid-http-veilid-remote = { path = "../../crates/veilid-http-veilid-remote" }
 veilid-http-wire = { path = "../../crates/veilid-http-wire" }
