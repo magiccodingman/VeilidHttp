@@ -1,5 +1,6 @@
 //! Stream-capable HTTP transaction handling over Veilid AppMessages.
 
+use crate::completion::{CompletionClaim, CompletionLookup, CompletionStore};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::{StreamExt as _, stream};
@@ -18,12 +19,12 @@ use veilid_http_http::{
     HeaderField, ResponseHead, attach_route_headers, normalize_request, upstream_url,
 };
 use veilid_http_stream::{
-    Ack, CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen,
+    CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen,
     StreamDirection, StreamError, decode, encode_ack, encode_error, encode_request_accepted,
     encode_response_open,
 };
 use veilid_http_transport::{RouteTarget, VeilidTransport};
-use veilid_http_wire::{Frame, FrameBundle};
+use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
 
 /// Runtime limits and one-upstream policy used by streamed transactions.
 #[derive(Debug, Clone)]
@@ -50,11 +51,19 @@ pub struct StreamingConfig {
 
 impl StreamingConfig {
     fn request_limit(&self) -> u64 {
-        if self.max_request_bytes == 0 { u64::MAX } else { self.max_request_bytes }
+        if self.max_request_bytes == 0 {
+            u64::MAX
+        } else {
+            self.max_request_bytes
+        }
     }
 
     fn response_limit(&self) -> u64 {
-        if self.max_response_bytes == 0 { u64::MAX } else { self.max_response_bytes }
+        if self.max_response_bytes == 0 {
+            u64::MAX
+        } else {
+            self.max_response_bytes
+        }
     }
 }
 
@@ -82,6 +91,7 @@ impl std::fmt::Debug for ServerTransaction {
 pub struct StreamingBridge {
     transport: Arc<dyn VeilidTransport>,
     client: reqwest::Client,
+    completion: Arc<CompletionStore>,
     config: StreamingConfig,
     transactions: Arc<Mutex<HashMap<[u8; 16], Arc<ServerTransaction>>>>,
     clock: Instant,
@@ -102,11 +112,13 @@ impl StreamingBridge {
     pub fn new(
         transport: Arc<dyn VeilidTransport>,
         client: reqwest::Client,
+        completion: Arc<CompletionStore>,
         config: StreamingConfig,
     ) -> Self {
         Self {
             transport,
             client,
+            completion,
             config,
             transactions: Arc::new(Mutex::new(HashMap::new())),
             clock: Instant::now(),
@@ -156,6 +168,41 @@ impl StreamingBridge {
             return Ok(());
         }
 
+        match self.completion.claim(transaction_id).await {
+            CompletionClaim::Execute => {}
+            CompletionClaim::Wait(_) | CompletionClaim::Replay(_) | CompletionClaim::Tombstone => {
+                let reply = encode_error(
+                    transaction_id,
+                    &StreamError {
+                        code: "transaction-already-seen".to_owned(),
+                        message: "transaction is already executing or completed; it will not be forwarded again".to_owned(),
+                        retryable: false,
+                    },
+                )?;
+                self.transport
+                    .app_call_reply(call_id, reply)
+                    .await
+                    .context("reply to duplicate completed RequestOpen")?;
+                return Ok(());
+            }
+        }
+
+        let result = self
+            .handle_open_claimed(call_id, site_fingerprint, transaction_id, open)
+            .await;
+        if result.is_err() {
+            self.completion.abandon(transaction_id).await;
+        }
+        result
+    }
+
+    async fn handle_open_claimed(
+        &self,
+        call_id: &str,
+        site_fingerprint: String,
+        transaction_id: [u8; 16],
+        open: RequestOpen,
+    ) -> Result<()> {
         let open = RequestOpen {
             head: normalize_request(open.head)?,
             ..open
@@ -179,7 +226,9 @@ impl StreamingBridge {
         )?;
 
         let (body_sender, body_receiver) = mpsc::channel::<Bytes>(
-            usize::try_from(self.config.window_frames).unwrap_or(32).max(1),
+            usize::try_from(self.config.window_frames)
+                .unwrap_or(32)
+                .max(1),
         );
         let request_receiver = if open.request_body {
             Some(InboundBody::new(
@@ -215,7 +264,7 @@ impl StreamingBridge {
         let runtime = self.clone();
         let task_transaction = Arc::clone(&transaction);
         let task = tokio::spawn(async move {
-            if let Err(error) = runtime
+            let result = runtime
                 .run_upstream(
                     transaction_id,
                     site_fingerprint,
@@ -223,8 +272,8 @@ impl StreamingBridge {
                     body_receiver,
                     Arc::clone(&task_transaction),
                 )
-                .await
-            {
+                .await;
+            if let Err(error) = &result {
                 tracing::error!(%error, transaction = %hex_transaction(transaction_id), "streamed HTTP transaction failed");
                 let _ = runtime
                     .send_error(
@@ -235,8 +284,11 @@ impl StreamingBridge {
                         false,
                     )
                     .await;
-                runtime.transactions.lock().await.remove(&transaction_id);
             }
+            if let Err(error) = runtime.completion.record(transaction_id, None).await {
+                tracing::error!(%error, transaction = %hex_transaction(transaction_id), "failed to persist streamed completion tombstone");
+            }
+            runtime.transactions.lock().await.remove(&transaction_id);
         });
         *transaction.task.lock().await = Some(task);
         Ok(())
@@ -249,6 +301,7 @@ impl StreamingBridge {
     /// Returns an error for malformed frames, missing transactions, body/ACK state
     /// failures, or transport dispatch failure.
     pub async fn handle_message(&self, payload: Bytes) -> Result<()> {
+        let mut pending_acks: HashMap<RouteTarget, Vec<Bytes>> = HashMap::new();
         for encoded in split_frames(payload)? {
             match decode(encoded.clone())? {
                 DecodedFrame::Data {
@@ -260,12 +313,15 @@ impl StreamingBridge {
                 | DecodedFrame::End {
                     transaction_id,
                     sequence,
-                    value: veilid_http_stream::StreamEnd {
-                        direction: StreamDirection::Request,
-                        ..
-                    },
+                    value:
+                        veilid_http_stream::StreamEnd {
+                            direction: StreamDirection::Request,
+                            ..
+                        },
                 } => {
-                    let transaction = self.transaction(transaction_id).await?;
+                    let Some(transaction) = self.transaction(transaction_id).await? else {
+                        continue;
+                    };
                     let output = transaction
                         .request_receiver
                         .lock()
@@ -278,7 +334,10 @@ impl StreamingBridge {
                         let Some(sender) = sender else {
                             bail!("upstream request body is already closed");
                         };
-                        sender.send(chunk).await.context("apply upstream request-body backpressure")?;
+                        sender
+                            .send(chunk)
+                            .await
+                            .context("apply upstream request-body backpressure")?;
                     }
                     if output.completed {
                         transaction.upstream_body.lock().await.take();
@@ -287,19 +346,19 @@ impl StreamingBridge {
                         || output.ack.selective != 0
                         || sequence % 4 == 3;
                     if should_ack {
-                        self.transport
-                            .app_message(
-                                &transaction.return_target,
-                                encode_ack(transaction_id, output.ack)?,
-                            )
-                            .await
-                            .context("send request-stream ACK")?;
+                        pending_acks
+                            .entry(transaction.return_target.clone())
+                            .or_default()
+                            .push(encode_ack(transaction_id, output.ack)?);
                     }
                 }
-                DecodedFrame::Ack { transaction_id, value }
-                    if value.direction == StreamDirection::Response =>
-                {
-                    let transaction = self.transaction(transaction_id).await?;
+                DecodedFrame::Ack {
+                    transaction_id,
+                    value,
+                } if value.direction == StreamDirection::Response => {
+                    let Some(transaction) = self.transaction(transaction_id).await? else {
+                        continue;
+                    };
                     let mut sender = transaction.response_sender.lock().await;
                     let outbound = sender
                         .as_mut()
@@ -311,7 +370,10 @@ impl StreamingBridge {
                 DecodedFrame::Cancel { transaction_id, .. } => {
                     self.cancel(transaction_id).await;
                 }
-                DecodedFrame::Error { transaction_id, value } => {
+                DecodedFrame::Error {
+                    transaction_id,
+                    value,
+                } => {
                     tracing::warn!(
                         transaction = %hex_transaction(transaction_id),
                         code = %value.code,
@@ -328,6 +390,11 @@ impl StreamingBridge {
                 }
             }
         }
+        for (target, frames) in pending_acks {
+            self.send_encoded_frames(&target, frames)
+                .await
+                .context("send batched request-stream ACKs")?;
+        }
         Ok(())
     }
 
@@ -338,22 +405,25 @@ impl StreamingBridge {
             .lock()
             .await
             .drain()
-            .map(|(_, transaction)| transaction)
             .collect::<Vec<_>>();
-        for transaction in transactions {
+        for (id, transaction) in transactions {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
+            }
+            if let Err(error) = self.completion.record(id, None).await {
+                tracing::error!(%error, transaction = %hex_transaction(id), "failed to persist cancelled transaction tombstone");
             }
         }
     }
 
-    async fn transaction(&self, id: [u8; 16]) -> Result<Arc<ServerTransaction>> {
-        self.transactions
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown or expired VHTTP transaction"))
+    async fn transaction(&self, id: [u8; 16]) -> Result<Option<Arc<ServerTransaction>>> {
+        if let Some(transaction) = self.transactions.lock().await.get(&id).cloned() {
+            return Ok(Some(transaction));
+        }
+        if self.completion.lookup(id).await.is_some() {
+            return Ok(None);
+        }
+        bail!("unknown or expired VHTTP transaction")
     }
 
     async fn cancel(&self, id: [u8; 16]) {
@@ -362,6 +432,18 @@ impl StreamingBridge {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
             }
+            if let Err(error) = self.completion.record(id, None).await {
+                tracing::error!(%error, transaction = %hex_transaction(id), "failed to persist cancelled transaction tombstone");
+            }
+        } else if matches!(
+            self.completion.lookup(id).await,
+            Some(
+                CompletionLookup::Response(_)
+                    | CompletionLookup::Tombstone
+                    | CompletionLookup::InFlight
+            )
+        ) {
+            tracing::debug!(transaction = %hex_transaction(id), "ignored cancellation for completed transaction");
         }
     }
 
@@ -394,9 +476,10 @@ impl StreamingBridge {
         }
         if open.request_body {
             let body_stream = stream::unfold(body_receiver, |mut receiver| async move {
-                receiver.recv().await.map(|chunk| {
-                    (Ok::<Bytes, std::io::Error>(chunk), receiver)
-                })
+                receiver
+                    .recv()
+                    .await
+                    .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), receiver))
             });
             request = request.body(reqwest::Body::wrap_stream(body_stream));
         }
@@ -417,7 +500,10 @@ impl StreamingBridge {
             })
             .collect::<Vec<_>>();
         let response_open = ResponseOpen {
-            head: ResponseHead { status, headers: response_headers },
+            head: ResponseHead {
+                status,
+                headers: response_headers,
+            },
             response_compression: CompressionMode::Zstd,
             response_body: true,
             request_receive_window: self.config.window_frames,
@@ -501,7 +587,6 @@ impl StreamingBridge {
                 () = &mut deadline => bail!("response acknowledgements exceeded overall timeout"),
             }
         }
-        self.transactions.lock().await.remove(&transaction_id);
         Ok(())
     }
 
@@ -538,14 +623,51 @@ impl StreamingBridge {
                     },
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|frame| frame.encoded)
+            .collect();
+        self.send_encoded_frames(&transaction.return_target, frames)
+            .await
+            .context("send or retry response stream frames")
+    }
+
+    async fn send_encoded_frames(
+        &self,
+        target: &RouteTarget,
+        frames: Vec<Bytes>,
+    ) -> Result<()> {
+        let mut bundle = Vec::new();
+        let mut encoded_bytes = 8_usize;
         for frame in frames {
-            self.transport
-                .app_message(&transaction.return_target, frame.encoded)
-                .await
-                .context("send or retry response stream frame")?;
+            let projected = encoded_bytes
+                .saturating_add(4)
+                .saturating_add(frame.len());
+            if !bundle.is_empty() && projected > VEILID_MESSAGE_LIMIT {
+                self.send_bundle(target, std::mem::take(&mut bundle)).await?;
+                encoded_bytes = 8;
+            }
+            encoded_bytes = encoded_bytes
+                .saturating_add(4)
+                .saturating_add(frame.len());
+            bundle.push(frame);
+        }
+        if !bundle.is_empty() {
+            self.send_bundle(target, bundle).await?;
         }
         Ok(())
+    }
+
+    async fn send_bundle(&self, target: &RouteTarget, frames: Vec<Bytes>) -> Result<()> {
+        let payload = if frames.len() == 1 {
+            frames.into_iter().next().expect("one frame")
+        } else {
+            FrameBundle { frames }.encode()?
+        };
+        self.transport
+            .app_message(target, payload)
+            .await
+            .context("send bundled VHTTP AppMessage")
     }
 
     async fn send_error(
