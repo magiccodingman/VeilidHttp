@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, agent/initial-veilid-http]
   pull_request:
   workflow_dispatch:
 
@@ -13,28 +13,7 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CI_REVISION: 2
-
 jobs:
-  source-snapshot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Upload exact PR source
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-snapshot
-          path: |
-            .
-            !.git
-            !target
-            !**/node_modules
-          include-hidden-files: true
-          retention-days: 1
-
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
