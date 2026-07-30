@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify};
 
-/// Result of claiming an atomic transaction identifier.
+/// Result of claiming a transaction identifier.
 #[derive(Debug)]
 pub enum CompletionClaim {
     /// The caller owns execution and must eventually record or abandon the result.
@@ -24,6 +24,8 @@ pub enum CompletionClaim {
     Tombstone,
     /// Another task is executing the transaction; wait and claim again after notification.
     Wait(Arc<Notify>),
+    /// The process-wide active transaction limit is currently exhausted.
+    Capacity,
 }
 
 /// Existing completed state used by streamed opening deduplication.
@@ -61,7 +63,8 @@ pub struct CompletionStore {
     directory: PathBuf,
     retention: Duration,
     max_response_bytes: usize,
-    max_entries: usize,
+    max_completed_entries: usize,
+    max_in_flight: usize,
     entries: Mutex<HashMap<[u8; 16], Entry>>,
 }
 
@@ -75,7 +78,8 @@ impl CompletionStore {
         directory: PathBuf,
         retention: Duration,
         max_response_bytes: usize,
-        max_entries: usize,
+        max_completed_entries: usize,
+        max_in_flight: usize,
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(&directory)
             .with_context(|| format!("create completion directory {}", directory.display()))?;
@@ -113,16 +117,22 @@ impl CompletionStore {
                 }
             }
         }
+        trim_loaded_entries(
+            &directory,
+            &mut entries,
+            max_completed_entries.max(1),
+        );
         Ok(Arc::new(Self {
             directory,
             retention,
             max_response_bytes,
-            max_entries: max_entries.max(1),
+            max_completed_entries: max_completed_entries.max(1),
+            max_in_flight: max_in_flight.max(1),
             entries: Mutex::new(entries),
         }))
     }
 
-    /// Claim an atomic transaction for execution or replay.
+    /// Claim a transaction for execution, replay, waiting, or capacity rejection.
     pub async fn claim(&self, id: [u8; 16]) -> CompletionClaim {
         let mut entries = self.entries.lock().await;
         self.prune_locked(&mut entries);
@@ -134,6 +144,13 @@ impl CompletionStore {
             }) => CompletionClaim::Replay(response.clone()),
             Some(Entry::Complete { response: None, .. }) => CompletionClaim::Tombstone,
             None => {
+                let active = entries
+                    .values()
+                    .filter(|entry| matches!(entry, Entry::InFlight(_)))
+                    .count();
+                if active >= self.max_in_flight {
+                    return CompletionClaim::Capacity;
+                }
                 entries.insert(id, Entry::InFlight(Arc::new(Notify::new())));
                 CompletionClaim::Execute
             }
@@ -178,12 +195,16 @@ impl CompletionStore {
                 expires_at_unix_seconds: expires_at,
             },
         );
-        self.enforce_entry_limit_locked(&mut entries);
+        let evicted = self.enforce_completed_limit_locked(&mut entries, id);
         drop(entries);
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
-        persist_entry(&self.directory, id, response.as_ref(), expires_at)
+        persist_entry(&self.directory, id, response.as_ref(), expires_at)?;
+        for evicted_id in evicted {
+            let _ = fs::remove_file(self.file_path(evicted_id));
+        }
+        Ok(())
     }
 
     /// Remove an in-flight claim when execution is known not to have reached the upstream.
@@ -215,16 +236,21 @@ impl CompletionStore {
         }
     }
 
-    fn enforce_entry_limit_locked(&self, entries: &mut HashMap<[u8; 16], Entry>) {
-        while entries.len() > self.max_entries {
+    fn enforce_completed_limit_locked(
+        &self,
+        entries: &mut HashMap<[u8; 16], Entry>,
+        protected_id: [u8; 16],
+    ) -> Vec<[u8; 16]> {
+        let mut evicted = Vec::new();
+        while completed_count(entries) > self.max_completed_entries {
             let oldest = entries
                 .iter()
                 .filter_map(|(id, entry)| match entry {
                     Entry::Complete {
                         expires_at_unix_seconds,
                         ..
-                    } => Some((*id, *expires_at_unix_seconds)),
-                    Entry::InFlight(_) => None,
+                    } if *id != protected_id => Some((*id, *expires_at_unix_seconds)),
+                    _ => None,
                 })
                 .min_by_key(|(_, expires_at)| *expires_at)
                 .map(|(id, _)| id);
@@ -232,12 +258,45 @@ impl CompletionStore {
                 break;
             };
             entries.remove(&id);
-            let _ = fs::remove_file(self.file_path(id));
+            evicted.push(id);
         }
+        evicted
     }
 
     fn file_path(&self, id: [u8; 16]) -> PathBuf {
         self.directory.join(format!("{}.json", hex_transaction(id)))
+    }
+}
+
+fn completed_count(entries: &HashMap<[u8; 16], Entry>) -> usize {
+    entries
+        .values()
+        .filter(|entry| matches!(entry, Entry::Complete { .. }))
+        .count()
+}
+
+fn trim_loaded_entries(
+    directory: &Path,
+    entries: &mut HashMap<[u8; 16], Entry>,
+    max_completed_entries: usize,
+) {
+    while completed_count(entries) > max_completed_entries {
+        let oldest = entries
+            .iter()
+            .filter_map(|(id, entry)| match entry {
+                Entry::Complete {
+                    expires_at_unix_seconds,
+                    ..
+                } => Some((*id, *expires_at_unix_seconds)),
+                Entry::InFlight(_) => None,
+            })
+            .min_by_key(|(_, expires_at)| *expires_at)
+            .map(|(id, _)| id);
+        let Some(id) = oldest else {
+            break;
+        };
+        entries.remove(&id);
+        let _ = fs::remove_file(directory.join(format!("{}.json", hex_transaction(id))));
     }
 }
 
@@ -322,6 +381,7 @@ mod tests {
             Duration::from_secs(60),
             1024,
             16,
+            4,
         )
         .unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
@@ -335,11 +395,12 @@ mod tests {
             Duration::from_secs(60),
             1024,
             16,
+            4,
         )
         .unwrap();
         assert!(matches!(
             reopened.lookup(id).await,
-            Some(CompletionLookup::Response(ref bytes)) if bytes == b"response"
+            Some(CompletionLookup::Response(ref bytes)) if bytes.as_ref() == b"response"
         ));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -354,6 +415,7 @@ mod tests {
             Duration::from_secs(60),
             4,
             16,
+            4,
         )
         .unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
@@ -365,6 +427,25 @@ mod tests {
             store.lookup(id).await,
             Some(CompletionLookup::Tombstone)
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_capacity_never_evicts_live_execution() {
+        let directory = temporary_directory("capacity");
+        let _ = fs::remove_dir_all(&directory);
+        let store = CompletionStore::open(
+            directory.clone(),
+            Duration::from_secs(60),
+            1024,
+            16,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(store.claim([1; 16]).await, CompletionClaim::Execute));
+        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Capacity));
+        store.abandon([1; 16]).await;
+        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Execute));
         fs::remove_dir_all(directory).unwrap();
     }
 }
