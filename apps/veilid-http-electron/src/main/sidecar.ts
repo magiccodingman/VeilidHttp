@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { app } from 'electron';
 import crypto from 'node:crypto';
 import net, { type Socket } from 'node:net';
@@ -12,13 +13,12 @@ const HEADER_BYTES = 24;
 const HELLO = 1;
 const REQUEST = 2;
 const RESPONSE = 3;
+const STREAM_DATA = 4;
+const STREAM_END = 5;
+const CANCEL = 6;
+const EVENT = 7;
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
-
-type Pending = {
-  resolve(value: SidecarReply<unknown>): void;
-  reject(error: Error): void;
-};
 
 type ResponseEnvelope<T> = {
   ok: boolean;
@@ -26,9 +26,31 @@ type ResponseEnvelope<T> = {
   error?: string;
 };
 
+type UnaryPending = {
+  kind: 'unary';
+  resolve(value: SidecarReply<unknown>): void;
+  reject(error: Error): void;
+};
+
+type StreamPending = {
+  kind: 'stream';
+  resolveHead(value: unknown): void;
+  rejectHead(error: Error): void;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  headResolved: boolean;
+  cleanup(): void;
+};
+
+type Pending = UnaryPending | StreamPending;
+
 export type SidecarReply<T> = {
   result: T;
   payload: Buffer;
+};
+
+export type SidecarStreamReply<T> = {
+  result: T;
+  body: ReadableStream<Uint8Array>;
 };
 
 export class Sidecar {
@@ -82,7 +104,7 @@ export class Sidecar {
 
     const helloId = 0n;
     const accepted = new Promise<SidecarReply<unknown>>((resolve, reject) => {
-      this.pending.set(helloId, { resolve, reject });
+      this.pending.set(helloId, { kind: 'unary', resolve, reject });
     });
     this.writeFrame(HELLO, helloId, { secret }, Buffer.alloc(0));
     await accepted;
@@ -114,10 +136,10 @@ export class Sidecar {
     payload: Buffer = Buffer.alloc(0),
   ): Promise<SidecarReply<T>> {
     await this.start();
-    const requestId = this.nextRequestId;
-    this.nextRequestId += 1n;
+    const requestId = this.allocateRequestId();
     return new Promise<SidecarReply<T>>((resolve, reject) => {
       this.pending.set(requestId, {
+        kind: 'unary',
         resolve: resolve as (value: SidecarReply<unknown>) => void,
         reject,
       });
@@ -125,16 +147,107 @@ export class Sidecar {
         this.writeFrame(REQUEST, requestId, { type, ...fields }, payload);
       } catch (error) {
         this.pending.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(toError(error));
       }
     });
   }
 
-  private writeFrame(kind: number, requestId: bigint, metadata: unknown, payload: Buffer): void {
-    if (!this.socket || this.socket.destroyed) throw new Error('VeilidHttp sidecar IPC is not connected');
+  async streamRequest<T>(
+    type: string,
+    fields: Record<string, unknown>,
+    requestBody: ReadableStream<Uint8Array> | null,
+    signal?: AbortSignal,
+  ): Promise<SidecarStreamReply<T>> {
+    await this.start();
+    const requestId = this.allocateRequestId();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const responseBody = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+      pull: () => {
+        if (this.socket?.isPaused()) this.socket.resume();
+      },
+      cancel: (reason) => {
+        this.cancelStream(requestId, reason instanceof Error ? reason.message : String(reason ?? 'response cancelled'));
+      },
+    }, { highWaterMark: 4 });
+
+    let abortListener: (() => void) | undefined;
+    const head = new Promise<T>((resolve, reject) => {
+      const cleanup = (): void => {
+        if (signal && abortListener) signal.removeEventListener('abort', abortListener);
+      };
+      this.pending.set(requestId, {
+        kind: 'stream',
+        resolveHead: resolve as (value: unknown) => void,
+        rejectHead: reject,
+        controller,
+        headResolved: false,
+        cleanup,
+      });
+      abortListener = (): void => this.cancelStream(requestId, signal?.reason instanceof Error
+        ? signal.reason.message
+        : 'request aborted');
+      if (signal) {
+        if (signal.aborted) {
+          abortListener();
+          return;
+        }
+        signal.addEventListener('abort', abortListener, { once: true });
+      }
+      try {
+        this.writeFrame(REQUEST, requestId, {
+          type,
+          ...fields,
+          hasBody: requestBody !== null,
+        }, Buffer.alloc(0));
+      } catch (error) {
+        this.failStream(requestId, toError(error), false);
+      }
+    });
+
+    if (requestBody !== null) {
+      void this.pumpRequestBody(requestId, requestBody).catch((error) => {
+        this.failStream(requestId, toError(error), true);
+      });
+    }
+
+    return { result: await head, body: responseBody };
+  }
+
+  private async pumpRequestBody(
+    requestId: bigint,
+    body: ReadableStream<Uint8Array>,
+  ): Promise<void> {
+    const reader = body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        for (let offset = 0; offset < bytes.length; offset += MAX_PAYLOAD_BYTES) {
+          const end = Math.min(offset + MAX_PAYLOAD_BYTES, bytes.length);
+          await this.writeFrameAsync(STREAM_DATA, requestId, {}, bytes.subarray(offset, end));
+        }
+      }
+      await this.writeFrameAsync(STREAM_END, requestId, {}, Buffer.alloc(0));
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private allocateRequestId(): bigint {
+    const requestId = this.nextRequestId;
+    this.nextRequestId += 1n;
+    return requestId;
+  }
+
+  private encodeFrame(kind: number, requestId: bigint, metadata: unknown, payload: Buffer): Buffer {
     const metadataBytes = Buffer.from(encode(metadata));
     if (metadataBytes.length > MAX_METADATA_BYTES) throw new Error('Sidecar metadata exceeds IPC limit');
-    if (payload.length > MAX_PAYLOAD_BYTES) throw new Error('Atomic sidecar payload exceeds IPC limit');
+    if (payload.length > MAX_PAYLOAD_BYTES) throw new Error('Sidecar payload exceeds IPC frame limit');
     const header = Buffer.alloc(HEADER_BYTES);
     MAGIC.copy(header, 0);
     header.writeUInt8(VERSION, 4);
@@ -143,7 +256,26 @@ export class Sidecar {
     header.writeBigUInt64BE(requestId, 8);
     header.writeUInt32BE(metadataBytes.length, 16);
     header.writeUInt32BE(payload.length, 20);
-    this.socket.write(Buffer.concat([header, metadataBytes, payload]));
+    return Buffer.concat([header, metadataBytes, payload]);
+  }
+
+  private writeFrame(kind: number, requestId: bigint, metadata: unknown, payload: Buffer): void {
+    const socket = this.socket;
+    if (!socket || socket.destroyed) throw new Error('VeilidHttp sidecar IPC is not connected');
+    socket.write(this.encodeFrame(kind, requestId, metadata, payload));
+  }
+
+  private async writeFrameAsync(
+    kind: number,
+    requestId: bigint,
+    metadata: unknown,
+    payload: Buffer,
+  ): Promise<void> {
+    const socket = this.socket;
+    if (!socket || socket.destroyed) throw new Error('VeilidHttp sidecar IPC is not connected');
+    if (!socket.write(this.encodeFrame(kind, requestId, metadata, payload))) {
+      await once(socket, 'drain');
+    }
   }
 
   private receive(chunk: Buffer): void {
@@ -158,7 +290,7 @@ export class Sidecar {
       const requestId = this.receiveBuffer.readBigUInt64BE(8);
       const metadataLength = this.receiveBuffer.readUInt32BE(16);
       const payloadLength = this.receiveBuffer.readUInt32BE(20);
-      if (version !== VERSION || kind !== RESPONSE) {
+      if (version !== VERSION || ![RESPONSE, STREAM_DATA, STREAM_END, CANCEL, EVENT].includes(kind)) {
         this.failAll(new Error('Unsupported VeilidHttp IPC response'));
         return;
       }
@@ -172,28 +304,106 @@ export class Sidecar {
       const payload = Buffer.from(this.receiveBuffer.subarray(HEADER_BYTES + metadataLength, total));
       this.receiveBuffer = this.receiveBuffer.subarray(total);
 
+      const pending = this.pending.get(requestId);
+      if (!pending) continue;
+      if (kind === STREAM_DATA) {
+        if (pending.kind !== 'stream') {
+          this.failAll(new Error('Received stream data for a unary IPC request'));
+          return;
+        }
+        pending.controller.enqueue(new Uint8Array(payload));
+        if ((pending.controller.desiredSize ?? 1) <= 0) this.socket?.pause();
+        continue;
+      }
+      if (kind === STREAM_END) {
+        if (pending.kind !== 'stream') {
+          this.failAll(new Error('Received stream end for a unary IPC request'));
+          return;
+        }
+        pending.controller.close();
+        pending.cleanup();
+        this.pending.delete(requestId);
+        continue;
+      }
+
       let envelope: ResponseEnvelope<unknown>;
       try {
         envelope = decode(metadataBytes) as ResponseEnvelope<unknown>;
       } catch (error) {
-        this.failAll(error instanceof Error ? error : new Error(String(error)));
+        this.failAll(toError(error));
         return;
       }
-      const pending = this.pending.get(requestId);
-      if (!pending) continue;
-      this.pending.delete(requestId);
-      if (envelope.ok) {
-        pending.resolve({ result: envelope.result, payload });
-      } else {
-        pending.reject(new Error(envelope.error ?? 'Sidecar request failed'));
+      if (kind === RESPONSE) {
+        if (pending.kind === 'unary') {
+          this.pending.delete(requestId);
+          if (envelope.ok) pending.resolve({ result: envelope.result, payload });
+          else pending.reject(new Error(envelope.error ?? 'Sidecar request failed'));
+          continue;
+        }
+        if (!envelope.ok) {
+          this.failStream(requestId, new Error(envelope.error ?? 'Sidecar stream request failed'), false);
+          continue;
+        }
+        if (!pending.headResolved) {
+          pending.headResolved = true;
+          pending.resolveHead(envelope.result);
+        }
+        if (payload.length > 0) pending.controller.enqueue(new Uint8Array(payload));
+        continue;
+      }
+
+      const streamError = new Error(envelope.error ?? 'Sidecar stream was cancelled');
+      this.failStream(requestId, streamError, false);
+    }
+  }
+
+  private cancelStream(requestId: bigint, reason: string): void {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.kind !== 'stream') return;
+    try {
+      this.writeFrame(CANCEL, requestId, { reason }, Buffer.alloc(0));
+    } catch {
+      // The connection failure path below still tears down the local stream.
+    }
+    this.failStream(requestId, new Error(reason), false);
+  }
+
+  private failStream(requestId: bigint, error: Error, notifySidecar: boolean): void {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.kind !== 'stream') return;
+    if (notifySidecar) {
+      try {
+        this.writeFrame(CANCEL, requestId, { reason: error.message }, Buffer.alloc(0));
+      } catch {
+        // IPC may already be gone.
       }
     }
+    if (!pending.headResolved) pending.rejectHead(error);
+    try {
+      pending.controller.error(error);
+    } catch {
+      // The stream may already have been closed by Chromium.
+    }
+    pending.cleanup();
+    this.pending.delete(requestId);
   }
 
   private failAll(error: Error): void {
     this.socket?.destroy();
     this.socket = undefined;
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      if (pending.kind === 'unary') {
+        pending.reject(error);
+      } else {
+        if (!pending.headResolved) pending.rejectHead(error);
+        try {
+          pending.controller.error(error);
+        } catch {
+          // Ignore already closed streams.
+        }
+        pending.cleanup();
+      }
+    }
     this.pending.clear();
     if (this.child && this.child.exitCode === null) this.child.kill();
     this.child = undefined;
@@ -207,4 +417,8 @@ export class Sidecar {
     this.child = undefined;
     this.failAll(new Error('VeilidHttp sidecar stopped'));
   }
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
