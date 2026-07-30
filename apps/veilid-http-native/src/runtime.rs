@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use veilid_http_core::RetryPolicy;
 use veilid_http_engine::{InboundBody, OutboundBody};
 use veilid_http_http::{RequestHead, ResponseHead};
@@ -19,15 +19,51 @@ use veilid_http_stream::{
 };
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_native::NativeVeilidTransport;
-use veilid_http_wire::{Frame, FrameBundle};
+use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
 
-/// Complete response used by the initial buffered Electron IPC compatibility path.
+/// Complete response convenience type built on top of the streaming runtime.
 #[derive(Debug, Clone)]
 pub struct BufferedResponse {
     /// HTTP response status and headers.
     pub head: ResponseHead,
     /// Complete logical response body.
     pub body: Bytes,
+}
+
+/// One event produced for a locally consuming HTTP response.
+#[derive(Debug)]
+pub enum ClientResponseEvent {
+    /// Upstream status and end-to-end response headers are available.
+    Head(ResponseHead),
+    /// One decompressed response-body chunk.
+    Data(Bytes),
+    /// The response stream completed and passed length/digest verification.
+    End,
+    /// The request failed before normal completion.
+    Error(String),
+}
+
+/// Handle returned immediately for one streaming HTTP transaction.
+#[derive(Debug)]
+pub struct ClientRequest {
+    /// Bounded request-body input. Dropping the sender marks the request body complete.
+    pub request_body: Option<mpsc::Sender<Bytes>>,
+    /// Bounded response event stream. Consuming it controls Veilid response ACK progress.
+    pub responses: mpsc::Receiver<ClientResponseEvent>,
+    cancel: watch::Sender<bool>,
+}
+
+impl ClientRequest {
+    /// Request cancellation of the remote transaction.
+    pub fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+
+    /// Clone a cancellation handle for an external connection registry.
+    #[must_use]
+    pub fn cancellation_handle(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,19 +146,64 @@ impl ClientRuntime {
             .context("import private server RouteBlob")
     }
 
-    /// Execute one HTTP request through the full streamed VHTTP path.
+    /// Start a fully streaming HTTP transaction.
     ///
-    /// The current Electron compatibility caller provides a buffered body and receives a
-    /// buffered response. Network transport between the native client and bridge is fully
-    /// streaming, bounded, acknowledged, and retryable; IPC streaming replaces this final
-    /// compatibility boundary separately.
+    /// Request input and response output are bounded channels. The runtime does not ACK
+    /// response bytes until the response channel accepts the corresponding logical chunk,
+    /// allowing IPC and Chromium backpressure to propagate through Veilid to the upstream.
+    #[must_use]
+    pub fn start_request(
+        self: &Arc<Self>,
+        server_target: RouteTarget,
+        head: RequestHead,
+        has_body: bool,
+    ) -> ClientRequest {
+        let (request_sender, request_receiver) = if has_body {
+            let (sender, receiver) = mpsc::channel(4);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let (response_sender, response_receiver) = mpsc::channel(8);
+        let (cancel_sender, cancel_receiver) = watch::channel(false);
+        let runtime = Arc::clone(self);
+        let terminal_sender = response_sender.clone();
+        tokio::spawn(async move {
+            let result = runtime
+                .run_stream(
+                    server_target,
+                    head,
+                    has_body,
+                    request_receiver,
+                    response_sender,
+                    cancel_receiver,
+                )
+                .await;
+            match result {
+                Ok(()) => {
+                    let _ = terminal_sender.send(ClientResponseEvent::End).await;
+                }
+                Err(error) => {
+                    let _ = terminal_sender
+                        .send(ClientResponseEvent::Error(error.to_string()))
+                        .await;
+                }
+            }
+        });
+        ClientRequest {
+            request_body: request_sender,
+            responses: response_receiver,
+            cancel: cancel_sender,
+        }
+    }
+
+    /// Execute a request and collect the response for tests and small control callers.
     ///
     /// # Errors
     ///
-    /// Returns an error for route, protocol, timeout, transport, compression, integrity,
-    /// remote cancellation, or response-size failure.
+    /// Returns any error surfaced by the streaming runtime.
     pub async fn request_buffered(
-        &self,
+        self: &Arc<Self>,
         server_target: &RouteTarget,
         head: RequestHead,
         body: Bytes,
@@ -132,39 +213,104 @@ impl ClientRuntime {
         {
             bail!("request body exceeds configured client limit");
         }
+        let request = self.start_request(server_target.clone(), head, !body.is_empty());
+        let ClientRequest {
+            request_body,
+            mut responses,
+            cancel: _,
+        } = request;
+        if let Some(sender) = request_body {
+            if !body.is_empty() {
+                sender
+                    .send(body)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("streaming request input closed"))?;
+            }
+            drop(sender);
+        }
+
+        let mut response_head = None;
+        let mut response_body = Vec::new();
+        while let Some(event) = responses.recv().await {
+            match event {
+                ClientResponseEvent::Head(head) => response_head = Some(head),
+                ClientResponseEvent::Data(chunk) => response_body.extend_from_slice(&chunk),
+                ClientResponseEvent::End => {
+                    return Ok(BufferedResponse {
+                        head: response_head.ok_or_else(|| {
+                            anyhow::anyhow!("transaction completed without ResponseOpen")
+                        })?,
+                        body: Bytes::from(response_body),
+                    });
+                }
+                ClientResponseEvent::Error(error) => bail!(error),
+            }
+        }
+        bail!("native response event channel closed before completion")
+    }
+
+    async fn run_stream(
+        &self,
+        server_target: RouteTarget,
+        head: RequestHead,
+        has_body: bool,
+        request_input: Option<mpsc::Receiver<Bytes>>,
+        response_events: mpsc::Sender<ClientResponseEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<()> {
         let transaction_id = rand::random::<[u8; 16]>();
         let (event_sender, mut events) = mpsc::unbounded_channel();
         self.transactions.lock().await.insert(transaction_id, event_sender);
         let result = self
-            .request_buffered_inner(
+            .run_stream_inner(
                 transaction_id,
-                server_target,
+                &server_target,
                 head,
-                body,
+                has_body,
+                request_input,
+                response_events,
                 &mut events,
+                cancel,
             )
             .await;
         self.transactions.lock().await.remove(&transaction_id);
+        if let Err(error) = &result {
+            let _ = self
+                .transport
+                .app_message(
+                    &server_target,
+                    encode_cancel(
+                        transaction_id,
+                        &veilid_http_stream::Cancel {
+                            reason: error.to_string(),
+                        },
+                    )?,
+                )
+                .await;
+        }
         result
     }
 
-    async fn request_buffered_inner(
+    #[allow(clippy::too_many_arguments)]
+    async fn run_stream_inner(
         &self,
         transaction_id: [u8; 16],
         server_target: &RouteTarget,
         head: RequestHead,
-        body: Bytes,
+        has_body: bool,
+        mut request_input: Option<mpsc::Receiver<Bytes>>,
+        response_events: mpsc::Sender<ClientResponseEvent>,
         events: &mut mpsc::UnboundedReceiver<Bytes>,
-    ) -> Result<BufferedResponse> {
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<()> {
         let return_route = self.return_route.read().await.clone();
-        let request_body = !body.is_empty();
         let opening = encode_request_open(
             transaction_id,
             &RequestOpen {
                 head,
                 return_route_blob: return_route.blob.to_vec(),
                 request_compression: CompressionMode::Zstd,
-                request_body,
+                request_body: has_body,
                 response_receive_window: u32::try_from(self.window_frames)
                     .context("response receive window does not fit u32")?,
             },
@@ -176,7 +322,10 @@ impl ClientRuntime {
             .await
             .context("open streamed VHTTP request")?;
         match decode(reply)? {
-            DecodedFrame::RequestAccepted { transaction_id: reply_id, value } => {
+            DecodedFrame::RequestAccepted {
+                transaction_id: reply_id,
+                value,
+            } => {
                 if reply_id != transaction_id {
                     bail!("RequestAccepted transaction identifier mismatch");
                 }
@@ -190,7 +339,7 @@ impl ClientRuntime {
             other => bail!("unexpected streamed AppCall reply: {other:?}"),
         }
 
-        let mut request_sender = if request_body {
+        let mut request_sender = if has_body {
             let mut sender = OutboundBody::new(
                 transaction_id,
                 StreamDirection::Request,
@@ -206,30 +355,18 @@ impl ClientRuntime {
         } else {
             None
         };
-        let mut request_offset = 0;
-        let mut request_finished = !request_body;
-        let mut response_head: Option<ResponseHead> = None;
+        let mut request_finished = !has_body;
+        let mut request_bytes = 0_u64;
+        let mut response_head_sent = false;
         let mut response_receiver: Option<InboundBody> = None;
-        let mut response_body = Vec::new();
         let mut response_finished = false;
         let deadline = tokio::time::sleep(self.overall_timeout);
         tokio::pin!(deadline);
 
         loop {
             if let Some(sender) = request_sender.as_mut() {
-                while request_offset < body.len() && !sender.is_backpressured() {
-                    let limit = sender.max_input_chunk();
-                    let end = request_offset.saturating_add(limit).min(body.len());
-                    sender.push(&body[request_offset..end], end == body.len())?;
-                    request_offset = end;
-                }
-                if request_offset == body.len() && !request_finished {
-                    sender.finish_input()?;
-                    request_finished = true;
-                }
                 self.dispatch_request_frames(server_target, sender).await?;
             }
-
             let request_complete = request_sender
                 .as_ref()
                 .is_none_or(OutboundBody::is_complete);
@@ -237,6 +374,10 @@ impl ClientRuntime {
                 break;
             }
 
+            let can_read_request = !request_finished
+                && request_sender
+                    .as_ref()
+                    .is_some_and(|sender| !sender.is_backpressured());
             tokio::select! {
                 frame = events.recv() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("native Veilid event stream closed"))?;
@@ -252,13 +393,17 @@ impl ClientRuntime {
                         DecodedFrame::ResponseOpen { transaction_id: id, value, initial_payload }
                             if id == transaction_id =>
                         {
-                            if response_head.is_some() {
+                            if response_head_sent {
                                 bail!("duplicate conflicting ResponseOpen");
                             }
                             if !initial_payload.is_empty() {
                                 bail!("ResponseOpen initial payload is reserved until sequenced initial-data support is enabled");
                             }
-                            response_head = Some(value.head);
+                            response_events
+                                .send(ClientResponseEvent::Head(value.head))
+                                .await
+                                .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
+                            response_head_sent = true;
                             if value.response_body {
                                 response_receiver = Some(InboundBody::new(
                                     transaction_id,
@@ -281,13 +426,18 @@ impl ClientRuntime {
                                 .ok_or_else(|| anyhow::anyhow!("response data arrived before ResponseOpen"))?;
                             let output = receiver.receive(frame)?;
                             for chunk in output.logical_chunks {
-                                response_body.extend_from_slice(&chunk);
+                                response_events
+                                    .send(ClientResponseEvent::Data(chunk))
+                                    .await
+                                    .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
                             }
                             if output.completed || output.ack.selective != 0 || sequence % 4 == 3 {
-                                self.transport
-                                    .app_message(server_target, encode_ack(transaction_id, output.ack)?)
-                                    .await
-                                    .context("send response-stream ACK")?;
+                                self.send_encoded_frames(
+                                    server_target,
+                                    vec![encode_ack(transaction_id, output.ack)?],
+                                )
+                                .await
+                                .context("send response-stream ACK")?;
                             }
                             response_finished = output.completed;
                         }
@@ -301,28 +451,60 @@ impl ClientRuntime {
                         other => tracing::debug!(?other, "ignored unrelated client stream frame"),
                     }
                 }
+                chunk = async {
+                    match request_input.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => None,
+                    }
+                }, if can_read_request => {
+                    match chunk {
+                        Some(chunk) => {
+                            request_bytes = request_bytes
+                                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                                .ok_or_else(|| anyhow::anyhow!("request length overflow"))?;
+                            if self.max_request_bytes != 0 && request_bytes > self.max_request_bytes {
+                                bail!("request body exceeds configured client limit");
+                            }
+                            let sender = request_sender
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                            let mut offset = 0;
+                            while offset < chunk.len() {
+                                let end = offset
+                                    .saturating_add(sender.max_input_chunk())
+                                    .min(chunk.len());
+                                sender.push(&chunk[offset..end], false)?;
+                                offset = end;
+                            }
+                        }
+                        None => {
+                            let sender = request_sender
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                            sender.finish_input()?;
+                            request_finished = true;
+                        }
+                    }
+                }
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        bail!("local HTTP request was cancelled");
+                    }
+                }
                 () = tokio::time::sleep(Duration::from_millis(50)) => {
                     if let Some(sender) = request_sender.as_mut() {
                         self.dispatch_request_frames(server_target, sender).await?;
                     }
                 }
                 () = &mut deadline => {
-                    let _ = self.transport.app_message(
-                        server_target,
-                        encode_cancel(
-                            transaction_id,
-                            &veilid_http_stream::Cancel { reason: "client overall timeout".to_owned() },
-                        )?,
-                    ).await;
                     bail!("VHTTP transaction exceeded overall timeout");
                 }
             }
         }
-
-        Ok(BufferedResponse {
-            head: response_head.ok_or_else(|| anyhow::anyhow!("transaction completed without ResponseOpen"))?,
-            body: Bytes::from(response_body),
-        })
+        if !response_head_sent {
+            bail!("transaction completed without ResponseOpen");
+        }
+        Ok(())
     }
 
     async fn dispatch_request_frames(
@@ -331,19 +513,56 @@ impl ClientRuntime {
         sender: &mut OutboundBody,
     ) -> Result<()> {
         let now = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        for frame in sender.take_sendable(
-            now,
-            RetryPolicy {
-                initial_ms: 250,
-                maximum_ms: 10_000,
-            },
-        ) {
-            self.transport
-                .app_message(target, frame.encoded)
-                .await
-                .context("send or retry request stream frame")?;
+        let frames = sender
+            .take_sendable(
+                now,
+                RetryPolicy {
+                    initial_ms: 250,
+                    maximum_ms: 10_000,
+                },
+            )
+            .into_iter()
+            .map(|frame| frame.encoded)
+            .collect();
+        self.send_encoded_frames(target, frames).await
+    }
+
+    async fn send_encoded_frames(
+        &self,
+        target: &RouteTarget,
+        frames: Vec<Bytes>,
+    ) -> Result<()> {
+        let mut bundle = Vec::new();
+        let mut encoded_bytes = 8_usize;
+        for frame in frames {
+            let projected = encoded_bytes
+                .saturating_add(4)
+                .saturating_add(frame.len());
+            if !bundle.is_empty() && projected > VEILID_MESSAGE_LIMIT {
+                self.send_bundle(target, std::mem::take(&mut bundle)).await?;
+                encoded_bytes = 8;
+            }
+            encoded_bytes = encoded_bytes
+                .saturating_add(4)
+                .saturating_add(frame.len());
+            bundle.push(frame);
+        }
+        if !bundle.is_empty() {
+            self.send_bundle(target, bundle).await?;
         }
         Ok(())
+    }
+
+    async fn send_bundle(&self, target: &RouteTarget, frames: Vec<Bytes>) -> Result<()> {
+        let payload = if frames.len() == 1 {
+            frames.into_iter().next().expect("one frame")
+        } else {
+            FrameBundle { frames }.encode()?
+        };
+        self.transport
+            .app_message(target, payload)
+            .await
+            .context("send or retry VHTTP stream frames")
     }
 
     async fn dispatch_updates(self: Arc<Self>) -> Result<()> {
