@@ -54,7 +54,7 @@ pub struct RequestOpen {
     pub request_compression: CompressionMode,
     /// Whether request body frames will follow.
     pub request_body: bool,
-    /// Maximum number of unacknowledged response frames initially accepted by the client.
+    /// Maximum unacknowledged response frames initially accepted by the client.
     pub response_receive_window: u32,
 }
 
@@ -74,7 +74,7 @@ pub struct ResponseOpen {
     pub response_compression: CompressionMode,
     /// Whether response body frames will follow.
     pub response_body: bool,
-    /// Maximum request data frames cumulatively accepted at this point.
+    /// Request receive-window state piggybacked onto the response opening.
     pub request_receive_window: u32,
 }
 
@@ -98,7 +98,7 @@ pub struct Ack {
     pub cumulative: Option<u32>,
     /// Selective bitmap for the next 64 sequence numbers.
     pub selective: u64,
-    /// Number of additional frames the receiver is currently willing to accept.
+    /// Additional frames currently accepted by the receiver.
     pub receive_window: u32,
 }
 
@@ -214,7 +214,7 @@ pub fn encode_request_open(
     value: &RequestOpen,
     initial_payload: Bytes,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
+    extension_frame(
         FrameType::RequestOpen,
         transaction_id,
         0,
@@ -233,7 +233,7 @@ pub fn encode_request_accepted(
     transaction_id: [u8; 16],
     value: RequestAccepted,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
+    extension_frame(
         FrameType::RequestAccepted,
         transaction_id,
         0,
@@ -253,7 +253,7 @@ pub fn encode_response_open(
     value: &ResponseOpen,
     initial_payload: Bytes,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
+    extension_frame(
         FrameType::ResponseOpen,
         transaction_id,
         0,
@@ -300,7 +300,7 @@ pub fn encode_end(
     sequence: u32,
     value: &StreamEnd,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
+    extension_frame(
         match value.direction {
             StreamDirection::Request => FrameType::RequestEnd,
             StreamDirection::Response => FrameType::ResponseEnd,
@@ -319,14 +319,7 @@ pub fn encode_end(
 ///
 /// Returns an error when metadata or the complete frame exceeds its bound.
 pub fn encode_ack(transaction_id: [u8; 16], value: Ack) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
-        FrameType::Ack,
-        transaction_id,
-        0,
-        ACK_EXTENSION,
-        &value,
-        Bytes::new(),
-    )
+    extension_frame(FrameType::Ack, transaction_id, 0, ACK_EXTENSION, &value, Bytes::new())
 }
 
 /// Encode an idempotent cancellation frame.
@@ -338,14 +331,7 @@ pub fn encode_cancel(
     transaction_id: [u8; 16],
     value: &Cancel,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
-        FrameType::Cancel,
-        transaction_id,
-        0,
-        CANCEL_EXTENSION,
-        value,
-        Bytes::new(),
-    )
+    extension_frame(FrameType::Cancel, transaction_id, 0, CANCEL_EXTENSION, value, Bytes::new())
 }
 
 /// Encode a structured error frame.
@@ -357,14 +343,7 @@ pub fn encode_error(
     transaction_id: [u8; 16],
     value: &StreamError,
 ) -> Result<Bytes, StreamProtocolError> {
-    encode_extension_frame(
-        FrameType::Error,
-        transaction_id,
-        0,
-        ERROR_EXTENSION,
-        value,
-        Bytes::new(),
-    )
+    extension_frame(FrameType::Error, transaction_id, 0, ERROR_EXTENSION, value, Bytes::new())
 }
 
 /// Decode one VHTTP frame into its streaming semantic representation.
@@ -407,10 +386,10 @@ pub fn decode(encoded: Bytes) -> Result<DecodedFrame, StreamProtocolError> {
         }),
         FrameType::RequestEnd | FrameType::ResponseEnd => {
             let value: StreamEnd = decode_extension(&frame, STREAM_END_EXTENSION)?;
-            let expected = match frame.frame_type {
-                FrameType::RequestEnd => StreamDirection::Request,
-                FrameType::ResponseEnd => StreamDirection::Response,
-                _ => unreachable!(),
+            let expected = if frame.frame_type == FrameType::RequestEnd {
+                StreamDirection::Request
+            } else {
+                StreamDirection::Response
             };
             if value.direction != expected {
                 return Err(StreamProtocolError::DirectionMismatch);
@@ -433,7 +412,7 @@ pub fn decode(encoded: Bytes) -> Result<DecodedFrame, StreamProtocolError> {
     }
 }
 
-fn encode_extension_frame<T: Serialize>(
+fn extension_frame<T: Serialize>(
     frame_type: FrameType,
     transaction_id: [u8; 16],
     sequence: u32,
@@ -472,19 +451,17 @@ fn decode_extension<T: DeserializeOwned>(
 }
 
 #[derive(Debug, Default)]
-struct ChunkSink {
-    pending: Vec<u8>,
-}
+struct ChunkSink(Vec<u8>);
 
 impl ChunkSink {
     fn take(&mut self) -> Bytes {
-        Bytes::from(std::mem::take(&mut self.pending))
+        Bytes::from(std::mem::take(&mut self.0))
     }
 }
 
 impl std::io::Write for ChunkSink {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.pending.extend_from_slice(buffer);
+        self.0.extend_from_slice(buffer);
         Ok(buffer.len())
     }
 
@@ -543,18 +520,17 @@ impl StreamEncoder {
 
     /// Add logical bytes and return compressed bytes emitted so far.
     ///
-    /// `flush` should be used for adaptive latency deadlines, not after every tiny write.
-    ///
     /// # Errors
     ///
-    /// Returns an error when compression or flushing fails, or length exceeds `u64`.
+    /// Returns an error when compression or flushing fails or length exceeds `u64`.
     pub fn push(&mut self, input: &[u8], flush: bool) -> Result<Bytes, StreamProtocolError> {
+        let additional = u64::try_from(input.len()).map_err(|_| StreamProtocolError::LogicalLimit {
+            actual: u64::MAX,
+            limit: u64::MAX - 1,
+        })?;
         self.logical_length = self
             .logical_length
-            .checked_add(u64::try_from(input.len()).map_err(|_| StreamProtocolError::LogicalLimit {
-                actual: u64::MAX,
-                limit: u64::MAX - 1,
-            })?)
+            .checked_add(additional)
             .ok_or(StreamProtocolError::LogicalLimit { actual: u64::MAX, limit: u64::MAX - 1 })?;
         self.hasher.update(input);
         match &mut self.compression {
@@ -578,7 +554,8 @@ impl StreamEncoder {
     ///
     /// Returns an error when the compressor cannot finish.
     pub fn finish(self) -> Result<(Bytes, StreamEnd), StreamProtocolError> {
-        let trailing = match self.compression {
+        let Self { direction, compression, hasher, logical_length } = self;
+        let trailing = match compression {
             EncoderState::None(mut sink) => sink.take(),
             EncoderState::Zstd(encoder) => {
                 let mut sink = encoder.finish()?;
@@ -588,9 +565,9 @@ impl StreamEncoder {
         Ok((
             trailing,
             StreamEnd {
-                direction: self.direction,
-                logical_length: self.logical_length,
-                blake3: *self.hasher.finalize().as_bytes(),
+                direction,
+                logical_length,
+                blake3: *hasher.finalize().as_bytes(),
             },
         ))
     }
@@ -651,7 +628,7 @@ impl StreamDecoder {
     ///
     /// # Errors
     ///
-    /// Returns an error for decompression failure or when logical output exceeds its bound.
+    /// Returns an error for decompression failure or logical-output overflow.
     pub fn push(&mut self, input: &[u8], flush: bool) -> Result<Bytes, StreamProtocolError> {
         let output = match &mut self.decompression {
             DecoderState::None(sink) => {
@@ -666,7 +643,12 @@ impl StreamDecoder {
                 decoder.get_mut().take()
             }
         };
-        self.record_output(&output)?;
+        record_output(
+            &mut self.hasher,
+            &mut self.logical_length,
+            self.max_logical_length,
+            &output,
+        )?;
         Ok(output)
     }
 
@@ -676,43 +658,53 @@ impl StreamDecoder {
     ///
     /// Returns an error for decompression failure, output overflow, direction mismatch,
     /// logical-length mismatch, or digest mismatch.
-    pub fn finish(mut self, expected: &StreamEnd) -> Result<Bytes, StreamProtocolError> {
-        if expected.direction != self.direction {
+    pub fn finish(self, expected: &StreamEnd) -> Result<Bytes, StreamProtocolError> {
+        let Self {
+            direction,
+            decompression,
+            mut hasher,
+            mut logical_length,
+            max_logical_length,
+        } = self;
+        if expected.direction != direction {
             return Err(StreamProtocolError::DirectionMismatch);
         }
-        let trailing = match self.decompression {
+        let trailing = match decompression {
             DecoderState::None(mut sink) => sink.take(),
-            DecoderState::Zstd(decoder) => {
-                let mut sink = decoder.finish()?;
+            DecoderState::Zstd(mut decoder) => {
+                decoder.flush()?;
+                let mut sink = decoder.into_inner();
                 sink.take()
             }
         };
-        self.record_output(&trailing)?;
-        if self.logical_length != expected.logical_length {
+        record_output(&mut hasher, &mut logical_length, max_logical_length, &trailing)?;
+        if logical_length != expected.logical_length {
             return Err(StreamProtocolError::LengthMismatch);
         }
-        if self.hasher.finalize().as_bytes() != &expected.blake3 {
+        if hasher.finalize().as_bytes() != &expected.blake3 {
             return Err(StreamProtocolError::DigestMismatch);
         }
         Ok(trailing)
     }
+}
 
-    fn record_output(&mut self, output: &[u8]) -> Result<(), StreamProtocolError> {
-        let additional = u64::try_from(output.len()).map_err(|_| StreamProtocolError::LogicalLimit {
-            actual: u64::MAX,
-            limit: self.max_logical_length,
-        })?;
-        let actual = self.logical_length.saturating_add(additional);
-        if actual > self.max_logical_length {
-            return Err(StreamProtocolError::LogicalLimit {
-                actual,
-                limit: self.max_logical_length,
-            });
-        }
-        self.logical_length = actual;
-        self.hasher.update(output);
-        Ok(())
+fn record_output(
+    hasher: &mut blake3::Hasher,
+    logical_length: &mut u64,
+    max_logical_length: u64,
+    output: &[u8],
+) -> Result<(), StreamProtocolError> {
+    let additional = u64::try_from(output.len()).map_err(|_| StreamProtocolError::LogicalLimit {
+        actual: u64::MAX,
+        limit: max_logical_length,
+    })?;
+    let actual = logical_length.saturating_add(additional);
+    if actual > max_logical_length {
+        return Err(StreamProtocolError::LogicalLimit { actual, limit: max_logical_length });
     }
+    *logical_length = actual;
+    hasher.update(output);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -727,7 +719,10 @@ mod tests {
             head: RequestHead {
                 method: "POST".to_owned(),
                 path_and_query: "/upload?q=1".to_owned(),
-                headers: vec![HeaderField { name: "content-type".to_owned(), value: "application/octet-stream".to_owned() }],
+                headers: vec![HeaderField {
+                    name: "content-type".to_owned(),
+                    value: "application/octet-stream".to_owned(),
+                }],
             },
             return_route_blob: vec![0, 1, 2, 255],
             request_compression: CompressionMode::Zstd,
@@ -760,7 +755,8 @@ mod tests {
         let input = (0..300_000_u32)
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<_>>();
-        let mut encoder = StreamEncoder::new(StreamDirection::Response, CompressionMode::Zstd, 3).unwrap();
+        let mut encoder =
+            StreamEncoder::new(StreamDirection::Response, CompressionMode::Zstd, 3).unwrap();
         let mut compressed = Vec::new();
         for chunk in input.chunks(7919) {
             compressed.extend_from_slice(&encoder.push(chunk, false).unwrap());
@@ -771,7 +767,7 @@ mod tests {
         let mut decoder = StreamDecoder::new(
             StreamDirection::Response,
             CompressionMode::Zstd,
-            input.len() as u64,
+            u64::try_from(input.len()).unwrap(),
         )
         .unwrap();
         let mut output = Vec::new();
@@ -804,11 +800,13 @@ mod tests {
 
     #[test]
     fn corrupted_end_digest_is_rejected() {
-        let mut encoder = StreamEncoder::new(StreamDirection::Request, CompressionMode::None, 0).unwrap();
+        let mut encoder =
+            StreamEncoder::new(StreamDirection::Request, CompressionMode::None, 0).unwrap();
         let encoded = encoder.push(b"hello", false).unwrap();
         let (_, mut end) = encoder.finish().unwrap();
         end.blake3[0] ^= 1;
-        let mut decoder = StreamDecoder::new(StreamDirection::Request, CompressionMode::None, 10).unwrap();
+        let mut decoder =
+            StreamDecoder::new(StreamDirection::Request, CompressionMode::None, 10).unwrap();
         assert_eq!(decoder.push(&encoded, false).unwrap(), Bytes::from_static(b"hello"));
         assert!(matches!(decoder.finish(&end), Err(StreamProtocolError::DigestMismatch)));
     }
