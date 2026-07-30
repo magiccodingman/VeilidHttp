@@ -1,5 +1,7 @@
 //! Docker-side VHTTP bridge process.
 
+mod streaming;
+
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
@@ -17,8 +19,10 @@ use veilid_http_http::{
     HeaderField, ResponseHead, attach_route_headers, decode_atomic_request,
     encode_atomic_response, upstream_url,
 };
+use veilid_http_stream::{StreamError, encode_error};
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_remote::{RemoteEndpoint, RemoteVeilidTransport};
+use streaming::{StreamingBridge, StreamingConfig};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Translate VHTTP/1 transactions to one HTTP upstream")]
@@ -29,6 +33,8 @@ struct Config {
     data_dir: PathBuf,
     #[arg(long, env = "VEILID_CLIENT_ENDPOINT", default_value = "127.0.0.1:5959")]
     veilid_client_endpoint: String,
+    #[arg(long, env = "VEILID_EXPECTED_VERSION_PREFIX", default_value = "0.5.5")]
+    expected_veilid_version_prefix: String,
     #[arg(long, env = "VHTTP_IDLE_TIMEOUT", default_value = "5m", value_parser = parse_duration)]
     idle_timeout: Duration,
     #[arg(long, env = "VHTTP_OVERALL_TIMEOUT", default_value = "60m", value_parser = parse_duration)]
@@ -43,6 +49,14 @@ struct Config {
     route_header: String,
     #[arg(long, env = "VHTTP_MAX_ATOMIC_BODY_BYTES", default_value_t = 8 * 1024 * 1024)]
     max_atomic_body_bytes: usize,
+    #[arg(long, env = "VHTTP_MAX_REQUEST_BYTES", default_value_t = 0)]
+    max_request_bytes: u64,
+    #[arg(long, env = "VHTTP_MAX_RESPONSE_BYTES", default_value_t = 0)]
+    max_response_bytes: u64,
+    #[arg(long, env = "VHTTP_MAX_PENDING_BYTES", default_value_t = 8 * 1024 * 1024)]
+    max_pending_bytes: usize,
+    #[arg(long, env = "VHTTP_MAX_OUT_OF_ORDER_BYTES", default_value_t = 4 * 1024 * 1024)]
+    max_out_of_order_bytes: usize,
     /// Validate configuration and persistence layout without starting the adapter.
     #[arg(long)]
     check: bool,
@@ -127,10 +141,9 @@ fn persist_route(data_dir: &Path, route: &ActiveRoute, veilid_version: &str) -> 
         .context("system clock is before Unix epoch")?
         .as_secs();
     let base64 = veilid_http_route::encode_route_blob(&route.blob);
-    let route_id = &route.target.0;
     let metadata = PersistedRoute {
         schema: "org.veilidhttp.server-route/v1",
-        route_id,
+        route_id: &route.target.0,
         fingerprint: &route.fingerprint,
         created_at_unix_seconds: now,
         veilid_version,
@@ -260,8 +273,8 @@ async fn forward_atomic(
         if body.len().saturating_add(chunk.len()) > config.max_atomic_body_bytes {
             return small_error_response(
                 request.transaction_id,
-                502,
-                "upstream response requires the VHTTP streaming path and exceeds the atomic limit",
+                409,
+                "response requires stream-capable RequestOpen with a client return route",
             );
         }
         body.extend_from_slice(&chunk);
@@ -276,8 +289,8 @@ async fn forward_atomic(
         Ok(response) => Ok(response),
         Err(error) => small_error_response(
             request.transaction_id,
-            502,
-            format!("upstream response does not fit the atomic VHTTP path: {error}"),
+            409,
+            format!("response requires the streamed VHTTP path: {error}"),
         ),
     }
 }
@@ -292,12 +305,39 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
             .await
             .context("connect to official veilid-server client API")?,
     );
+    if !transport
+        .server_version()
+        .starts_with(&config.expected_veilid_version_prefix)
+    {
+        bail!(
+            "veilid-server {} does not match remote API schema prefix {}",
+            transport.server_version(),
+            config.expected_veilid_version_prefix
+        );
+    }
     let route = allocate_route(&transport, &config.data_dir).await?;
     let active_route = Arc::new(RwLock::new(route));
     let client = reqwest::Client::builder()
         .timeout(config.overall_timeout)
         .build()
         .context("build upstream HTTP client")?;
+    let transport_trait: Arc<dyn VeilidTransport> = transport.clone();
+    let streaming = StreamingBridge::new(
+        transport_trait,
+        client.clone(),
+        StreamingConfig {
+            upstream_url: config.upstream_url.clone(),
+            route_header: config.route_header.clone(),
+            frame_bytes: config.frame_bytes,
+            window_frames: u32::try_from(config.send_window_frames)
+                .context("send window does not fit u32")?,
+            max_pending_bytes: config.max_pending_bytes,
+            max_out_of_order_bytes: config.max_out_of_order_bytes,
+            max_request_bytes: config.max_request_bytes,
+            max_response_bytes: config.max_response_bytes,
+            overall_timeout: config.overall_timeout,
+        },
+    );
 
     let current = active_route.read().await;
     let ready = Ready {
@@ -317,35 +357,67 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
     loop {
         match transport.next_event().await.context("receive Veilid update")? {
             TransportEvent::AppCall { call_id, route, payload } => {
-                let transport = Arc::clone(&transport);
-                let config = Arc::clone(&config);
-                let client = client.clone();
-                let active_route = Arc::clone(&active_route);
-                tokio::spawn(async move {
-                    let current = active_route.read().await.clone();
-                    if route.as_ref() != Some(&current.target) {
-                        tracing::warn!(?route, "ignoring AppCall for a non-current route");
-                        return;
-                    }
-                    let response = match forward_atomic(&client, &config, &current.fingerprint, payload).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::error!(%error, "failed to translate atomic HTTP request");
-                            return;
+                let current = active_route.read().await.clone();
+                if route.as_ref() != Some(&current.target) {
+                    tracing::warn!(?route, "ignoring AppCall for a non-current route");
+                    continue;
+                }
+                if StreamingBridge::is_stream_open(payload.clone()) {
+                    let streaming = streaming.clone();
+                    let transport = Arc::clone(&transport);
+                    tokio::spawn(async move {
+                        if let Err(error) = streaming
+                            .handle_open(&call_id, current.fingerprint, payload.clone())
+                            .await
+                        {
+                            tracing::error!(%error, "failed to accept streamed RequestOpen");
+                            if let Ok(frame) = veilid_http_wire::Frame::decode(payload) {
+                                if let Ok(encoded) = encode_error(
+                                    frame.transaction_id,
+                                    &StreamError {
+                                        code: "request-open-rejected".to_owned(),
+                                        message: error.to_string(),
+                                        retryable: false,
+                                    },
+                                ) {
+                                    let _ = transport.app_call_reply(&call_id, encoded).await;
+                                }
+                            }
                         }
-                    };
-                    if let Err(error) = transport.app_call_reply(&call_id, response).await {
-                        tracing::error!(%error, "failed to reply to Veilid AppCall");
-                    }
-                });
+                    });
+                } else {
+                    let transport = Arc::clone(&transport);
+                    let config = Arc::clone(&config);
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        let response = match forward_atomic(&client, &config, &current.fingerprint, payload).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                tracing::error!(%error, "failed to translate atomic HTTP request");
+                                return;
+                            }
+                        };
+                        if let Err(error) = transport.app_call_reply(&call_id, response).await {
+                            tracing::error!(%error, "failed to reply to atomic Veilid AppCall");
+                        }
+                    });
+                }
             }
             TransportEvent::AppMessage { route, payload } => {
-                tracing::debug!(?route, bytes = payload.len(), "bulk VHTTP AppMessage received before stream engine activation");
+                let current = active_route.read().await.clone();
+                if route.as_ref() != Some(&current.target) {
+                    tracing::warn!(?route, "ignoring AppMessage for a non-current route");
+                    continue;
+                }
+                if let Err(error) = streaming.handle_message(payload).await {
+                    tracing::warn!(%error, "rejected VHTTP continuation AppMessage");
+                }
             }
             TransportEvent::RouteChanged { route, dead: true } => {
                 let current = active_route.read().await.clone();
                 if route == current.target {
-                    tracing::warn!(fingerprint = %current.fingerprint, "active private route died; allocating replacement");
+                    tracing::warn!(fingerprint = %current.fingerprint, "active private route died; cancelling streams and allocating replacement");
+                    streaming.cancel_all().await;
                     let replacement = allocate_route(&transport, &config.data_dir).await?;
                     *active_route.write().await = replacement;
                 }
@@ -370,8 +442,11 @@ async fn main() -> Result<()> {
     if config.frame_bytes > veilid_http_wire::DEFAULT_FRAME_LIMIT {
         bail!("frame bytes exceed conservative VHTTP limit");
     }
-    if config.send_window_frames == 0 {
-        bail!("send window must be non-zero");
+    if config.send_window_frames == 0 || config.send_window_frames > 64 {
+        bail!("send window must be in 1..=64");
+    }
+    if config.max_pending_bytes < config.frame_bytes {
+        bail!("VHTTP_MAX_PENDING_BYTES must hold at least one frame");
     }
     ensure_layout(&config.data_dir)?;
 
