@@ -49,6 +49,9 @@ jobs:
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
+      - name: Verify service workers, storage, CORS, and streams on veilid://
+        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron test/electron-pwa-smoke.cjs
+        timeout-minutes: 2
       - name: Preserve generated pnpm lockfile
         if: always()
         uses: actions/upload-artifact@v4
