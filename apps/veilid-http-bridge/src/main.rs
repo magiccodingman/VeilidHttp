@@ -13,7 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 use url::Url;
@@ -362,6 +362,7 @@ async fn handle_atomic_call(
             return;
         }
     };
+    let waiting_started = Instant::now();
 
     loop {
         match completion.claim(transaction_id).await {
@@ -419,10 +420,8 @@ async fn handle_atomic_call(
                 return;
             }
             CompletionClaim::Wait(notify) => {
-                if tokio::time::timeout(config.overall_timeout, notify.notified())
-                    .await
-                    .is_err()
-                {
+                let elapsed = waiting_started.elapsed();
+                if elapsed >= config.overall_timeout {
                     let response = small_error_response(
                         transaction_id,
                         504,
@@ -433,6 +432,9 @@ async fn handle_atomic_call(
                     }
                     return;
                 }
+                let remaining = config.overall_timeout.saturating_sub(elapsed);
+                let recheck_after = remaining.min(Duration::from_millis(50));
+                let _ = tokio::time::timeout(recheck_after, notify.notified()).await;
             }
         }
     }
