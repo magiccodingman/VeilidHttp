@@ -17,11 +17,13 @@ LABEL org.opencontainers.image.source="https://github.com/magiccodingman/VeilidH
 LABEL org.opencontainers.image.description="VeilidHttp server bridge and official veilid-server"
 ENV VEILID_RELEASE_CHANNEL=${VEILID_RELEASE_CHANNEL} \
     VEILID_VERSION=${VEILID_VERSION} \
-    VEILID_EXPECTED_VERSION_PREFIX=0.5.5 \
+    VEILID_EXPECTED_VERSION_PREFIX=${VEILID_VERSION} \
     VEILID_CLIENT_ENDPOINT=127.0.0.1:5959
 
-# Veilid is selected at image-build time. The running container never performs apt
-# updates; a newer Veilid version requires a tested image rebuild and normal rollout.
+# Veilid is selected at image-build time. Debian repositories may append a package
+# revision (for example -1), so resolve the exact available package whose upstream
+# version begins with VEILID_VERSION, require CLI/server to share that version, and pin
+# both. The running container never mutates itself with apt upgrades.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg tini procps netcat-openbsd \
     && curl -fsSL https://packages.veilid.net/gpg/veilid-packages-key.public \
@@ -29,9 +31,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
       > /etc/apt/sources.list.d/veilid.list \
     && apt-get update \
+    && resolved_version="$(apt-cache madison veilid-server \
+         | awk -v prefix="${VEILID_VERSION}" '$3 ~ ("^" prefix "([-+~:]|$)") { print $3; exit }')" \
+    && test -n "${resolved_version}" \
+    && apt-cache madison veilid-cli \
+         | awk -v version="${resolved_version}" '$3 == version { found=1 } END { exit !found }' \
     && apt-get install -y --no-install-recommends \
-         "veilid-server=${VEILID_VERSION}" \
-         "veilid-cli=${VEILID_VERSION}" \
+         "veilid-server=${resolved_version}" \
+         "veilid-cli=${resolved_version}" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/veilid-http-bridge /usr/local/bin/
