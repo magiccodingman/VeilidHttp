@@ -5,20 +5,23 @@ ARG DEBIAN_VERSION=13.6
 FROM rust:${RUST_VERSION}-trixie
 ARG TARGETARCH=amd64
 ARG VEILID_RELEASE_CHANNEL=stable
+ARG VEILID_VERSION=0.5.5
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg tini procps \
+      ca-certificates curl gnupg tini procps netcat-openbsd \
     && curl -fsSL https://packages.veilid.net/gpg/veilid-packages-key.public \
       | gpg --dearmor -o /usr/share/keyrings/veilid-packages-keyring.gpg \
     && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
       > /etc/apt/sources.list.d/veilid.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends veilid-server veilid-cli \
+    && apt-get install -y --no-install-recommends \
+         "veilid-server=${VEILID_VERSION}" \
+         "veilid-cli=${VEILID_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-COPY docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh docker/update-veilid.sh /usr/local/bin/
+COPY docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh /usr/local/bin/
 COPY docker/veilid-server.conf /etc/veilid-server/veilid-server.conf
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.dev.sh /usr/local/bin/healthcheck.sh /usr/local/bin/update-veilid.sh \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.dev.sh /usr/local/bin/healthcheck.sh \
     && install -d -o veilid -g veilid /data/veilid /data/bridge
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.dev.sh"]
