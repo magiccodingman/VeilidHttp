@@ -5,6 +5,7 @@ use veilid_http_core::{FrameBatcher, ReceiveWindow, RetryPolicy};
 use veilid_http_stream::{
     Ack, CompressionMode, StreamDirection, StreamEncoder, StreamEnd, encode_data, encode_end,
 };
+use veilid_http_wire::DEFAULT_FRAME_LIMIT;
 
 /// One encoded frame retained until its cumulative/selective acknowledgement arrives.
 #[derive(Debug, Clone)]
@@ -19,7 +20,7 @@ pub struct RetainedFrame {
     pub attempts: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PendingItem {
     Data(Bytes),
     End(StreamEnd),
@@ -43,7 +44,8 @@ pub struct OutboundBody {
     batcher: FrameBatcher,
     pending: VecDeque<PendingItem>,
     pending_bytes: usize,
-    max_pending_bytes: usize,
+    in_flight_bytes: usize,
+    max_buffered_bytes: usize,
     local_window: usize,
     peer_window: usize,
     next_sequence: u32,
@@ -54,9 +56,12 @@ pub struct OutboundBody {
 impl OutboundBody {
     /// Create one independently compressed bounded body sender.
     ///
+    /// The byte bound covers both compressed frames waiting for the send window and
+    /// complete encoded frames retained for retransmission.
+    ///
     /// # Errors
     ///
-    /// Returns an error for an invalid frame window/pending bound or compression setup.
+    /// Returns an error for an invalid frame window/buffer bound or compression setup.
     pub fn new(
         transaction_id: [u8; 16],
         direction: StreamDirection,
@@ -71,7 +76,13 @@ impl OutboundBody {
             return Err(EngineError::InvalidWindow(window_frames));
         }
         let batcher = FrameBatcher::new(frame_limit, reserved_metadata);
-        if max_pending_bytes < batcher.target_payload() {
+        let conservative_frame_bytes = frame_limit.min(DEFAULT_FRAME_LIMIT);
+        let minimum_window_bytes = conservative_frame_bytes
+            .checked_mul(window_frames)
+            .ok_or(EngineError::InvalidPendingBound(max_pending_bytes))?;
+        if max_pending_bytes < minimum_window_bytes
+            || max_pending_bytes < batcher.target_payload()
+        {
             return Err(EngineError::InvalidPendingBound(max_pending_bytes));
         }
         Ok(Self {
@@ -81,7 +92,8 @@ impl OutboundBody {
             batcher,
             pending: VecDeque::new(),
             pending_bytes: 0,
-            max_pending_bytes,
+            in_flight_bytes: 0,
+            max_buffered_bytes: max_pending_bytes,
             local_window: window_frames,
             peer_window: window_frames,
             next_sequence: 0,
@@ -99,7 +111,7 @@ impl OutboundBody {
     /// Whether the source should stop reading until ACKs release capacity.
     #[must_use]
     pub fn is_backpressured(&self) -> bool {
-        self.pending_bytes >= self.max_pending_bytes
+        self.buffered_bytes() >= self.max_buffered_bytes
             || self.in_flight.len() >= self.effective_window()
     }
 
@@ -191,7 +203,9 @@ impl OutboundBody {
             .filter(|sequence| ReceiveWindow::acknowledges(snapshot, *sequence))
             .collect::<Vec<_>>();
         for sequence in &acknowledged {
-            self.in_flight.remove(sequence);
+            if let Some(frame) = self.in_flight.remove(sequence) {
+                self.in_flight_bytes = self.in_flight_bytes.saturating_sub(frame.encoded.len());
+            }
         }
         self.pump()?;
         Ok(acknowledged)
@@ -232,10 +246,22 @@ impl OutboundBody {
         self.input_finished && self.pending.is_empty() && self.in_flight.is_empty()
     }
 
-    /// Encoded/compressed bytes waiting outside the retransmission window.
+    /// Compressed payload bytes waiting outside the retransmission window.
     #[must_use]
     pub const fn pending_bytes(&self) -> usize {
         self.pending_bytes
+    }
+
+    /// Complete encoded frame bytes retained for retransmission.
+    #[must_use]
+    pub const fn in_flight_bytes(&self) -> usize {
+        self.in_flight_bytes
+    }
+
+    /// Total pending plus retransmission bytes owned by this stream.
+    #[must_use]
+    pub const fn buffered_bytes(&self) -> usize {
+        self.pending_bytes.saturating_add(self.in_flight_bytes)
     }
 
     /// Frames retained for retransmission.
@@ -257,33 +283,48 @@ impl OutboundBody {
 
     fn queue(&mut self, item: PendingItem) -> Result<(), EngineError> {
         let retained = item.retained_bytes();
-        let actual = self.pending_bytes.saturating_add(retained);
-        if actual > self.max_pending_bytes {
+        let actual = self.buffered_bytes().saturating_add(retained);
+        if actual > self.max_buffered_bytes {
             return Err(EngineError::PendingLimit {
                 actual,
-                limit: self.max_pending_bytes,
+                limit: self.max_buffered_bytes,
             });
         }
-        self.pending_bytes = actual;
+        self.pending_bytes = self.pending_bytes.saturating_add(retained);
         self.pending.push_back(item);
         Ok(())
     }
 
     fn pump(&mut self) -> Result<(), EngineError> {
         while self.in_flight.len() < self.effective_window() {
-            let Some(item) = self.pending.pop_front() else { break };
-            self.pending_bytes = self.pending_bytes.saturating_sub(item.retained_bytes());
+            let Some(item) = self.pending.front().cloned() else {
+                break;
+            };
             let sequence = self.next_sequence;
+            let encoded = match &item {
+                PendingItem::Data(payload) => {
+                    encode_data(self.transaction_id, self.direction, sequence, payload.clone())?
+                }
+                PendingItem::End(end) => encode_end(self.transaction_id, sequence, end)?,
+            };
+            let projected = self
+                .buffered_bytes()
+                .saturating_sub(item.retained_bytes())
+                .saturating_add(encoded.len());
+            if projected > self.max_buffered_bytes {
+                return Err(EngineError::PendingLimit {
+                    actual: projected,
+                    limit: self.max_buffered_bytes,
+                });
+            }
+
+            self.pending.pop_front();
+            self.pending_bytes = self.pending_bytes.saturating_sub(item.retained_bytes());
             self.next_sequence = self
                 .next_sequence
                 .checked_add(1)
                 .ok_or(EngineError::SequenceExhausted)?;
-            let encoded = match item {
-                PendingItem::Data(payload) => {
-                    encode_data(self.transaction_id, self.direction, sequence, payload)?
-                }
-                PendingItem::End(end) => encode_end(self.transaction_id, sequence, &end)?,
-            };
+            self.in_flight_bytes = self.in_flight_bytes.saturating_add(encoded.len());
             self.in_flight.insert(
                 sequence,
                 RetainedFrame {
