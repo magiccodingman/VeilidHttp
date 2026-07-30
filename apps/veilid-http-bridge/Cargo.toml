@@ -28,5 +28,8 @@ veilid-http-transport = { path = "../../crates/veilid-http-transport" }
 veilid-http-veilid-remote = { path = "../../crates/veilid-http-veilid-remote" }
 veilid-http-wire = { path = "../../crates/veilid-http-wire" }
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [lints]
 workspace = true
