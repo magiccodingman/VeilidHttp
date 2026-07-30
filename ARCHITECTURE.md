@@ -9,6 +9,18 @@ Both ends remain ordinary:
 - The backend receives an ordinary HTTP request at one configured upstream URL.
 - VHTTP/1 owns only the translation required to cross Veilid's message boundary.
 
+```text
+ordinary PWA / SPA / static / SSR site
+        ↕ HTTP semantics
+locked-down Electron + native Rust client
+        ↕ VHTTP/1
+Veilid private server and client-return routes
+        ↕ VHTTP/1
+one Debian container: veilid-server + Rust bridge
+        ↕ ordinary HTTP
+one configured upstream application or reverse proxy
+```
+
 ## Components
 
 ```text
@@ -16,112 +28,164 @@ Electron main process
 ├── trusted navigation shell
 ├── sandboxed site WebContentsView
 ├── privileged veilid:// protocol handler
-└── native Rust sidecar
-    ├── VHTTP client engine
-    ├── route registry
-    └── Veilid native adapter
+└── authenticated private binary IPC
+    └── native Rust sidecar
+        ├── embedded veilid-core 0.5.7
+        ├── rotating private return route
+        ├── VHTTP client engine
+        └── bounded streaming channels
 
 Debian 13.6 container
-├── official veilid-server process
+├── official pinned veilid-server 0.5.5
 └── veilid-http-bridge
-    ├── Veilid remote adapter
+    ├── multiplexed remote API adapter
+    ├── published private receiving route
     ├── VHTTP server engine
+    ├── persistent completion coordinator
     └── one HTTP upstream
 ```
 
 ## Scope boundary
 
-VeilidHttp owns framing, compression, fragmentation, ordering, selective ACKs,
-retry decisions, deduplication, cancellation, expiration, bounded buffering,
-backpressure, and HTTP reconstruction.
+VeilidHttp owns framing, compression, fragmentation, transport bundling, ordering,
+selective ACKs, retry decisions, persistent duplicate suppression, cancellation,
+expiration, bounded buffering, backpressure, and HTTP reconstruction.
 
-It does not own routing among backend services. One upstream is configured. A user
-who needs several services points that one upstream at NGINX, HAProxy, Caddy,
-Traefik, or an application gateway.
+It does not own routing among backend services. One upstream is configured. A user who
+needs several services points that upstream at NGINX, HAProxy, Caddy, Traefik, or an
+application gateway. VeilidHttp also does not own HTTP caching, CDN behavior, load
+balancing, authentication, WebSockets, SignalR, WebTransport, CONNECT, or arbitrary
+TCP/UDP tunnels.
 
 ## Core crates
 
-- `veilid-http-wire`: deterministic VHTTP frame encoding and protocol metadata.
-- `veilid-http-core`: batching, receive windows, reassembly, compression limits,
-  transaction state, and retry-safe completion tracking.
-- `veilid-http-transport`: abstract AppCall/AppMessage contract.
-- `veilid-http-http`: HTTP head models, hop-by-hop filtering, upstream URL building,
+- `veilid-http-wire`: deterministic VHTTP frames and multi-frame Veilid bundles.
+- `veilid-http-core`: batching, windows, ACKs, retries, reassembly, compression, and
+  integrity helpers.
+- `veilid-http-engine`: shared bounded outgoing/incoming body state machines.
+- `veilid-http-stream`: MessagePack stream metadata and frame codecs.
+- `veilid-http-route`: RouteBlob Base64URL plus BLAKE3/Base32 site identities.
+- `veilid-http-http`: HTTP policy, hop-by-hop filtering, atomic codec, one-upstream URL,
   and trusted forwarding metadata.
+- `veilid-http-ipc`: authenticated framed binary sidecar transport.
+- `veilid-http-transport`: abstract AppCall/AppMessage contract.
+- `veilid-http-veilid-native`: embedded client adapter.
+- `veilid-http-veilid-remote`: official server remote API adapter.
 
 ## Transport model
 
-Small transactions may use AppCall and return an atomic response. Large or streaming
-transactions open with AppCall and use AppMessage for pipelined body frames and
-selective acknowledgements. A successful AppMessage dispatch is not treated as an
-application-level completion; VHTTP maintains its own receipts and transaction state.
+The generic Electron client uses the streamed opening for normal website requests:
+
+1. AppCall `RequestOpen` to the server private route.
+2. The opening carries HTTP metadata and the client's private return RouteBlob.
+3. AppCall reply `RequestAccepted` advertises request receive capacity.
+4. AppMessages carry request data/end and selective ACKs.
+5. AppMessages to the client return route carry response open/data/end.
+6. Client ACKs, cancellation, and errors travel back to the server route.
+
+A compact atomic AppCall/AtomicResponse path remains available for bounded control/tests.
+It does not guess response size or silently change modes after executing a request.
 
 Veilid's 32,768-byte application payload ceiling is never filled to the edge. The
-initial complete-frame target is 30 KiB, leaving room for VHTTP metadata and future
-extensions.
+complete-frame target is 30 KiB. Several complete VHTTP frames can share one length-
+prefixed Veilid AppMessage bundle while preserving independent transaction state.
 
-## Streaming
-
-Streaming is end-to-end and bounded:
+## Streaming and memory
 
 ```text
-browser ReadableStream
-↕ bounded native IPC
-↕ zstd stream + VHTTP frames
-↕ Veilid AppMessages
-↕ zstd stream + bounded HTTP body
-↕ upstream application
+Chromium ReadableStream
+↕ bounded socket/pipe IPC
+↕ bounded native channels
+↕ independent streaming zstd context
+↕ pending + retained retransmission byte budget
+↕ Veilid AppMessage bundles
+↕ bounded reassembly and zstd decoder
+↕ bounded upstream HTTP body
 ```
 
-No design step requires materializing a 70 GB model in memory or on disk. A bounded
-window is retained for retransmission; optional spool storage is a safety valve, not
-the normal path for a complete object.
+No step materializes a complete 70 GB object. The sender byte budget covers compressed
+bytes waiting outside the window plus complete encoded frames retained for retry. The
+receiver emits contiguous bytes and retains only bounded compressed out-of-order data.
+The full configured frame window must fit inside the pending-byte budget or construction
+fails.
+
+Backpressure propagates by delaying local consumption and ACK progress. Object size does
+not determine peak memory; active transaction count, window sizes, compression buffers,
+and out-of-order limits do. Both client and bridge cap active transactions.
+
+V1 does not pretend to resume a transfer after process restart and does not hide complete
+objects in disk spool. Persistent completion records protect recent upstream execution,
+not unfinished body bytes.
+
+## At-most-once forwarding
+
+Every transaction uses a 128-bit ID. The bridge coordinates atomic and streamed paths:
+
+- Concurrent duplicates do not create another upstream request.
+- Small atomic responses may be retained and replayed.
+- Large or streamed completions leave durable tombstones.
+- Recent completed IDs are not forwarded again after a lost reply or restart.
+
+This is an honest at-most-once boundary within retained bridge state, not a claim of
+perfect distributed exactly-once side effects.
 
 ## Browser origin
 
-The preferred origin is `veilid://<route-fingerprint>/`. Electron registers the
-scheme as standard, secure, Fetch-capable, CORS-enabled, stream-capable, and service-
-worker-capable. Each site uses an isolated persistent Electron partition.
+The preferred origin is `veilid://<route-fingerprint>/`. Electron registers the scheme
+as standard, secure, Fetch-capable, CORS-enabled, stream-capable, code-cache-capable,
+and service-worker-capable. Each site uses an isolated persistent partition.
 
-The compatibility fallback is `http://<fingerprint>.veilid.localhost:<stable-port>/`.
-A changing port changes origin and therefore is not acceptable for persistent service
-workers or IndexedDB.
+A real Electron smoke harness validates service workers, Cache Storage, IndexedDB,
+CORS, WebAssembly, secure-context behavior, persistent sessions, and a streamed custom-
+protocol response. If Chromium rejects an important framework behavior, the fallback is
+`http://<fingerprint>.veilid.localhost:<stable-port>/`; disabling web security or
+emulating certificates is not acceptable.
 
-## Route identity
+## Route identity and lifecycle
 
-The initial site identifier is the first 128 bits of BLAKE3 over the complete binary
-RouteBlob, encoded as lowercase unpadded Base32. The same blob produces the same ID.
-Route rotation may change the origin; stable application identity is intentionally a
-future signed-manifest layer rather than a hidden V1 promise.
+The V1 site identifier is the first 128 bits of BLAKE3 over the complete binary
+RouteBlob, encoded as 26 lowercase unpadded Base32 characters. The same blob produces
+the same ID.
+
+The server allocates and atomically publishes a reliable private RouteBlob. The client
+imports it and separately allocates a private return route. A dead receiving or return
+route triggers rotation. Route rotation can change the server fingerprint/origin;
+stable signed application identity and discovery remain future layers rather than a
+hidden protocol promise.
 
 ## Security
 
-The loaded site receives normal browser powers and no Node/Electron/native powers.
-The renderer is sandboxed, context isolated, and has Node integration disabled.
-Standard uploads and downloads remain available because they are user-mediated browser
+The loaded site receives normal Chromium powers and no Node/Electron/native powers. The
+renderer is sandboxed, context-isolated, and has Node integration disabled. Standard
+uploads and downloads remain available because they are user-mediated browser
 operations, not arbitrary filesystem access.
+
+Electron main and the sidecar communicate through a random mode-0600 Unix socket or
+Windows named pipe authenticated by a one-launch secret. IPC metadata/payload sizes are
+bounded. Public HTTPS remains ordinary Chromium networking. Cross-origin Veilid requests
+remain subject to Chromium CORS.
 
 ## Forwarded route metadata
 
-The bridge strips any incoming spoofed route headers and adds a trusted value:
+The bridge strips any spoofed values and adds:
 
 ```http
 X-Veilid-Route-Fingerprint: <128-bit-base32-fingerprint>
 X-Veilid-Origin: veilid://<fingerprint>
 ```
 
-A reverse proxy may route or log using these values. They are transport metadata, not
-an authentication credential. Applications still need real authentication.
+A reverse proxy may log or route using these values. They describe the receiving
+VeilidHttp route; they are not user authentication credentials.
 
 ## Hostile-network defaults
 
-- 5 minute idle timeout.
-- 60 minute overall timeout.
-- AbortSignal-driven cancellation from browser requests.
-- 32-frame initial send window.
-- Selective ACK bitmap.
-- Retry only missing frames.
-- 15 minute completed transaction retention.
-- Bounded decompression and frame sizes.
+- 5 minute idle policy and 60 minute overall transaction timeout.
+- AbortSignal-driven cancellation.
+- 32-frame initial windows and 64-bit selective ACK maps.
+- Retry only missing/unacknowledged frames with bounded exponential delay.
+- 8 MiB pending/retransmission and 4 MiB out-of-order budgets per direction.
+- 15 minute persistent completion retention.
+- Bounded decompression, frame, IPC, transaction, and completion counts.
 
-All values are configurable, but defaults assume multi-hop latency rather than a fast
-local LAN.
+Defaults assume multi-hop latency rather than a fast LAN. Real-network profiling and
+route-lifecycle observation remain required before a production release.
