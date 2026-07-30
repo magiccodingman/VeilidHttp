@@ -6,6 +6,7 @@ FROM rust:${RUST_VERSION}-trixie
 ARG TARGETARCH=amd64
 ARG VEILID_RELEASE_CHANNEL=stable
 ARG VEILID_VERSION=0.5.5
+ENV VEILID_EXPECTED_VERSION_PREFIX=${VEILID_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg tini procps netcat-openbsd \
@@ -14,9 +15,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
       > /etc/apt/sources.list.d/veilid.list \
     && apt-get update \
+    && resolved_version="$(apt-cache madison veilid-server \
+         | awk -v prefix="${VEILID_VERSION}" '$3 ~ ("^" prefix "([-+~:]|$)") { print $3; exit }')" \
+    && test -n "${resolved_version}" \
+    && apt-cache madison veilid-cli \
+         | awk -v version="${resolved_version}" '$3 == version { found=1 } END { exit !found }' \
     && apt-get install -y --no-install-recommends \
-         "veilid-server=${VEILID_VERSION}" \
-         "veilid-cli=${VEILID_VERSION}" \
+         "veilid-server=${resolved_version}" \
+         "veilid-cli=${resolved_version}" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
