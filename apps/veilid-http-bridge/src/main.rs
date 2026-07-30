@@ -1,10 +1,12 @@
 //! Docker-side VHTTP bridge process.
 
+mod completion;
 mod streaming;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
+use completion::{CompletionClaim, CompletionStore};
 use futures::StreamExt as _;
 use serde::Serialize;
 use std::{
@@ -57,10 +59,16 @@ struct Config {
     max_pending_bytes: usize,
     #[arg(long, env = "VHTTP_MAX_OUT_OF_ORDER_BYTES", default_value_t = 4 * 1024 * 1024)]
     max_out_of_order_bytes: usize,
+    #[arg(long, env = "VHTTP_COMPLETED_RETENTION", default_value = "15m", value_parser = parse_duration)]
+    completed_retention: Duration,
+    #[arg(long, env = "VHTTP_COMPLETED_RESPONSE_BYTES", default_value_t = 1024 * 1024)]
+    completed_response_bytes: usize,
+    #[arg(long, env = "VHTTP_COMPLETED_MAX_ENTRIES", default_value_t = 4096)]
+    completed_max_entries: usize,
     /// Validate configuration and persistence layout without starting the adapter.
     #[arg(long)]
     check: bool,
-    /// Keep a validation-only bridge process alive for Docker development.
+    /// Keep a validation-only bridge process alive for explicit configuration tests.
     #[arg(long)]
     validation_supervisor: bool,
 }
@@ -98,9 +106,13 @@ struct PersistedRoute<'a> {
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    let split = value.find(|character: char| !character.is_ascii_digit()).unwrap_or(value.len());
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
     let (amount, unit) = value.split_at(split);
-    let amount: u64 = amount.parse().map_err(|_| "duration must start with an integer")?;
+    let amount: u64 = amount
+        .parse()
+        .map_err(|_| "duration must start with an integer")?;
     let seconds = match unit {
         "s" | "" => amount,
         "m" => amount.saturating_mul(60),
@@ -126,7 +138,9 @@ fn ensure_layout(data_dir: &Path) -> Result<()> {
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!(
         "{}.tmp",
-        path.extension().and_then(|value| value.to_str()).unwrap_or("file")
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file")
     ));
     fs::write(&temporary, contents).with_context(|| format!("write {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
@@ -155,7 +169,10 @@ fn persist_route(data_dir: &Path, route: &ActiveRoute, veilid_version: &str) -> 
     atomic_write(&route_dir.join("current.blob"), &route.blob)?;
     atomic_write(&route_dir.join("current.base64"), base64.as_bytes())?;
     atomic_write(&route_dir.join("current.json"), &metadata_json)?;
-    atomic_write(&history_dir.join(format!("{now}-{}.blob", route.fingerprint)), &route.blob)?;
+    atomic_write(
+        &history_dir.join(format!("{now}-{}.blob", route.fingerprint)),
+        &route.blob,
+    )?;
     atomic_write(
         &history_dir.join(format!("{now}-{}.json", route.fingerprint)),
         &metadata_json,
@@ -167,7 +184,10 @@ async fn allocate_route(
     transport: &RemoteVeilidTransport,
     data_dir: &Path,
 ) -> Result<ActiveRoute> {
-    let (target, blob) = transport.allocate_route().await.context("allocate reliable private route")?;
+    let (target, blob) = transport
+        .allocate_route()
+        .await
+        .context("allocate reliable private route")?;
     let route = ActiveRoute {
         target,
         fingerprint: veilid_http_route::fingerprint(&blob),
@@ -196,9 +216,18 @@ fn small_error_response(
         ResponseHead {
             status,
             headers: vec![
-                HeaderField { name: "content-type".to_owned(), value: "text/plain; charset=utf-8".to_owned() },
-                HeaderField { name: "cache-control".to_owned(), value: "no-store".to_owned() },
-                HeaderField { name: "content-length".to_owned(), value: body.len().to_string() },
+                HeaderField {
+                    name: "content-type".to_owned(),
+                    value: "text/plain; charset=utf-8".to_owned(),
+                },
+                HeaderField {
+                    name: "cache-control".to_owned(),
+                    value: "no-store".to_owned(),
+                },
+                HeaderField {
+                    name: "content-length".to_owned(),
+                    value: body.len().to_string(),
+                },
             ],
         },
         body,
@@ -218,7 +247,13 @@ async fn forward_atomic(
         .unwrap_or([0; 16]);
     let request = match decode_atomic_request(encoded_request, config.max_atomic_body_bytes) {
         Ok(request) => request,
-        Err(error) => return small_error_response(transaction_id, 400, format!("invalid VHTTP request: {error}")),
+        Err(error) => {
+            return small_error_response(
+                transaction_id,
+                400,
+                format!("invalid VHTTP request: {error}"),
+            );
+        }
     };
     let target = upstream_url(&config.upstream_url, &request.head.path_and_query)?;
     let method = reqwest::Method::from_bytes(request.head.method.as_bytes())
@@ -244,7 +279,13 @@ async fn forward_atomic(
 
     let response = match upstream_request.send().await {
         Ok(response) => response,
-        Err(error) => return small_error_response(request.transaction_id, 502, format!("upstream request failed: {error}")),
+        Err(error) => {
+            return small_error_response(
+                request.transaction_id,
+                502,
+                format!("upstream request failed: {error}"),
+            );
+        }
     };
     let status = response.status().as_u16();
     let response_headers = response
@@ -282,7 +323,10 @@ async fn forward_atomic(
 
     match encode_atomic_response(
         request.transaction_id,
-        ResponseHead { status, headers: response_headers },
+        ResponseHead {
+            status,
+            headers: response_headers,
+        },
         &body,
         true,
     ) {
@@ -292,6 +336,105 @@ async fn forward_atomic(
             409,
             format!("response requires the streamed VHTTP path: {error}"),
         ),
+    }
+}
+
+async fn handle_atomic_call(
+    transport: Arc<RemoteVeilidTransport>,
+    client: reqwest::Client,
+    config: Arc<Config>,
+    completion: Arc<CompletionStore>,
+    call_id: String,
+    site_fingerprint: String,
+    payload: Bytes,
+) {
+    let transaction_id = match veilid_http_wire::Frame::decode(payload.clone()) {
+        Ok(frame) => frame.transaction_id,
+        Err(error) => {
+            let response = small_error_response(
+                [0; 16],
+                400,
+                format!("invalid VHTTP frame: {error}"),
+            );
+            if let Ok(response) = response {
+                let _ = transport.app_call_reply(&call_id, response).await;
+            }
+            return;
+        }
+    };
+
+    loop {
+        match completion.claim(transaction_id).await {
+            CompletionClaim::Execute => {
+                let response = match forward_atomic(
+                    &client,
+                    &config,
+                    &site_fingerprint,
+                    payload.clone(),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        completion.abandon(transaction_id).await;
+                        match small_error_response(
+                            transaction_id,
+                            500,
+                            format!("atomic translation failed: {error}"),
+                        ) {
+                            Ok(response) => response,
+                            Err(encoding_error) => {
+                                tracing::error!(%encoding_error, "failed to encode atomic failure");
+                                return;
+                            }
+                        }
+                    }
+                };
+                if let Err(error) = completion
+                    .record(transaction_id, Some(response.clone()))
+                    .await
+                {
+                    tracing::error!(%error, "failed to persist atomic completion record");
+                }
+                if let Err(error) = transport.app_call_reply(&call_id, response).await {
+                    tracing::error!(%error, "failed to reply to atomic Veilid AppCall");
+                }
+                return;
+            }
+            CompletionClaim::Replay(response) => {
+                if let Err(error) = transport.app_call_reply(&call_id, response).await {
+                    tracing::error!(%error, "failed to replay retained atomic response");
+                }
+                return;
+            }
+            CompletionClaim::Tombstone => {
+                let response = small_error_response(
+                    transaction_id,
+                    409,
+                    "transaction already completed; retained response is unavailable",
+                );
+                if let Ok(response) = response {
+                    let _ = transport.app_call_reply(&call_id, response).await;
+                }
+                return;
+            }
+            CompletionClaim::Wait(notify) => {
+                if tokio::time::timeout(config.overall_timeout, notify.notified())
+                    .await
+                    .is_err()
+                {
+                    let response = small_error_response(
+                        transaction_id,
+                        504,
+                        "timed out waiting for the original transaction execution",
+                    );
+                    if let Ok(response) = response {
+                        let _ = transport.app_call_reply(&call_id, response).await;
+                    }
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -317,6 +460,12 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
     }
     let route = allocate_route(&transport, &config.data_dir).await?;
     let active_route = Arc::new(RwLock::new(route));
+    let completion = CompletionStore::open(
+        config.data_dir.join("completed"),
+        config.completed_retention,
+        config.completed_response_bytes,
+        config.completed_max_entries,
+    )?;
     let client = reqwest::Client::builder()
         .timeout(config.overall_timeout)
         .build()
@@ -325,6 +474,7 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
     let streaming = StreamingBridge::new(
         transport_trait,
         client.clone(),
+        Arc::clone(&completion),
         StreamingConfig {
             upstream_url: config.upstream_url.clone(),
             route_header: config.route_header.clone(),
@@ -356,7 +506,11 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
 
     loop {
         match transport.next_event().await.context("receive Veilid update")? {
-            TransportEvent::AppCall { call_id, route, payload } => {
+            TransportEvent::AppCall {
+                call_id,
+                route,
+                payload,
+            } => {
                 let current = active_route.read().await.clone();
                 if route.as_ref() != Some(&current.target) {
                     tracing::warn!(?route, "ignoring AppCall for a non-current route");
@@ -386,21 +540,15 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
                         }
                     });
                 } else {
-                    let transport = Arc::clone(&transport);
-                    let config = Arc::clone(&config);
-                    let client = client.clone();
-                    tokio::spawn(async move {
-                        let response = match forward_atomic(&client, &config, &current.fingerprint, payload).await {
-                            Ok(response) => response,
-                            Err(error) => {
-                                tracing::error!(%error, "failed to translate atomic HTTP request");
-                                return;
-                            }
-                        };
-                        if let Err(error) = transport.app_call_reply(&call_id, response).await {
-                            tracing::error!(%error, "failed to reply to atomic Veilid AppCall");
-                        }
-                    });
+                    tokio::spawn(handle_atomic_call(
+                        Arc::clone(&transport),
+                        client.clone(),
+                        Arc::clone(&config),
+                        Arc::clone(&completion),
+                        call_id,
+                        current.fingerprint,
+                        payload,
+                    ));
                 }
             }
             TransportEvent::AppMessage { route, payload } => {
@@ -448,11 +596,18 @@ async fn main() -> Result<()> {
     if config.max_pending_bytes < config.frame_bytes {
         bail!("VHTTP_MAX_PENDING_BYTES must hold at least one frame");
     }
+    if config.completed_response_bytes > config.max_atomic_body_bytes {
+        bail!("VHTTP_COMPLETED_RESPONSE_BYTES cannot exceed VHTTP_MAX_ATOMIC_BODY_BYTES");
+    }
     ensure_layout(&config.data_dir)?;
 
     if config.check || config.validation_supervisor {
         let ready = Ready {
-            status: if config.check { "configuration-valid" } else { "validation-supervisor" },
+            status: if config.check {
+                "configuration-valid"
+            } else {
+                "validation-supervisor"
+            },
             upstream: upstream.as_str(),
             frame_bytes: config.frame_bytes,
             send_window_frames: config.send_window_frames,
@@ -464,7 +619,9 @@ async fn main() -> Result<()> {
         };
         println!("{}", serde_json::to_string(&ready)?);
         if config.validation_supervisor {
-            tokio::signal::ctrl_c().await.context("wait for shutdown signal")?;
+            tokio::signal::ctrl_c()
+                .await
+                .context("wait for shutdown signal")?;
         }
         return Ok(());
     }
@@ -484,7 +641,10 @@ mod tests {
 
     #[test]
     fn route_files_are_atomically_published() {
-        let root = std::env::temp_dir().join(format!("veilid-http-bridge-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "veilid-http-bridge-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         ensure_layout(&root).unwrap();
         let route = ActiveRoute {
@@ -493,7 +653,10 @@ mod tests {
             blob: Bytes::from_static(b"route"),
         };
         persist_route(&root, &route, "test").unwrap();
-        assert_eq!(fs::read(root.join("route/current.blob")).unwrap(), b"route");
+        assert_eq!(
+            fs::read(root.join("route/current.blob")).unwrap(),
+            b"route"
+        );
         assert!(root.join("route/current.json").is_file());
         assert!(root.join("route/current.base64").is_file());
         fs::remove_dir_all(root).unwrap();
