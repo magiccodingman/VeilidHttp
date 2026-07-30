@@ -1,0 +1,38 @@
+name: veilid-http
+
+services:
+  veilid-http:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        VEILID_RELEASE_CHANNEL: ${VEILID_RELEASE_CHANNEL:-stable}
+        VEILID_VERSION: ${VEILID_VERSION:-latest}
+    image: ghcr.io/magiccodingman/veilid-http-server:${VHTTP_IMAGE_TAG:-dev}
+    container_name: veilid-http
+    restart: unless-stopped
+    environment:
+      VHTTP_UPSTREAM_URL: ${VHTTP_UPSTREAM_URL:?Set VHTTP_UPSTREAM_URL in .env}
+      VHTTP_DATA_DIR: /data/bridge
+      VHTTP_LOG_LEVEL: ${VHTTP_LOG_LEVEL:-info}
+      VHTTP_IDLE_TIMEOUT: ${VHTTP_IDLE_TIMEOUT:-5m}
+      VHTTP_OVERALL_TIMEOUT: ${VHTTP_OVERALL_TIMEOUT:-60m}
+      VHTTP_FRAME_BYTES: ${VHTTP_FRAME_BYTES:-30720}
+      VHTTP_SEND_WINDOW_FRAMES: ${VHTTP_SEND_WINDOW_FRAMES:-32}
+      VHTTP_FORWARD_ROUTE_HEADER: ${VHTTP_FORWARD_ROUTE_HEADER:-X-Veilid-Route-Fingerprint}
+      VHTTP_ADAPTER_MODE: ${VHTTP_ADAPTER_MODE:-remote}
+      VEILID_AUTO_UPDATE: ${VEILID_AUTO_UPDATE:-true}
+      VEILID_VERSION: ${VEILID_VERSION:-latest}
+      RUST_LOG: ${VHTTP_LOG_LEVEL:-info}
+    volumes:
+      - ./data/veilid:/data/veilid
+      - ./data/bridge:/data/bridge
+    ports:
+      - "5150:5150/tcp"
+      - "5150:5150/udp"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

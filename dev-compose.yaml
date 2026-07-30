@@ -1,0 +1,26 @@
+services:
+  veilid-http:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    image: veilid-http:dev
+    restart: "no"
+    environment:
+      VHTTP_UPSTREAM_URL: ${VHTTP_UPSTREAM_URL:-http://host.docker.internal:8080}
+      VHTTP_DATA_DIR: /data/bridge
+      VHTTP_LOG_LEVEL: debug
+      VHTTP_ADAPTER_MODE: validation
+      VEILID_AUTO_UPDATE: ${VEILID_AUTO_UPDATE:-true}
+      RUST_LOG: veilid_http=debug
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/workspace/target
+      - ./data/dev/veilid:/data/veilid
+      - ./data/dev/bridge:/data/bridge
+
+volumes:
+  cargo-cache:
+  target-cache:

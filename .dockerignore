@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.vs
+.vscode
+node_modules
+**/node_modules
+target
+**/target
+apps/veilid-http-electron/out
+apps/veilid-http-electron/.webpack
+data
+.env
+*.log
