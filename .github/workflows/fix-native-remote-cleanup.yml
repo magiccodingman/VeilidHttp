@@ -1,10 +1,11 @@
 name: Fix native and remote Rust cleanup
 
 on:
-  workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - agent/complete-veilid-http
+      - main
+    paths:
+      - .github/workflows/fix-native-remote-cleanup.yml
 
 permissions:
   contents: write
