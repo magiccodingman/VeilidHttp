@@ -51,6 +51,11 @@ unsafe_code = "forbid"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# These style lints add noise without improving the protocol or safety boundary.
+doc_markdown = "allow"
+missing_errors_doc = "allow"
 module_name_repetitions = "allow"
+# Decoders intentionally take owned `Bytes` so they can split payloads without copying.
+needless_pass_by_value = "allow"
