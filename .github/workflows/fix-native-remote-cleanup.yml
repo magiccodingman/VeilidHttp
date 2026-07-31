@@ -1,0 +1,244 @@
+name: Fix native and remote Rust cleanup
+
+on:
+  push:
+    branches:
+      - agent/complete-veilid-http
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/complete-veilid-http
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+          components: rustfmt, clippy
+      - name: Apply focused Rust cleanup
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_exact(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          remote_path = Path("crates/veilid-http-veilid-remote/src/lib.rs")
+          remote = remote_path.read_text()
+          remote = replace_exact(
+              remote,
+              "fn unwrap_api_result<T>(result: ApiResult<T>) -> Result<T, TransportError> {\n",
+              "fn unwrap_api_result<T>(result: ApiResult<T>) -> Result<T, TransportError>\nwhere\n    T: Clone + std::fmt::Debug + schemars::JsonSchema,\n{\n",
+              "remote ApiResult bounds",
+          )
+          remote = replace_exact(
+              remote,
+              "fn unwrap_string_result<T>(result: ApiResultWithString<T>) -> Result<String, TransportError> {\n",
+              "fn unwrap_string_result<T>(result: ApiResultWithString<T>) -> Result<T, TransportError>\nwhere\n    T: Clone + std::fmt::Debug,\n{\n",
+              "remote string-result bounds",
+          )
+          remote = replace_exact(
+              remote,
+              "Ok(RouteTarget(unwrap_string_result(result)?))",
+              "Ok(RouteTarget(unwrap_string_result(result)?.to_string()))",
+              "remote imported route conversion",
+          )
+          remote_path.write_text(remote)
+
+          runtime_path = Path("apps/veilid-http-native/src/runtime.rs")
+          runtime = runtime_path.read_text()
+          runtime = replace_exact(
+              runtime,
+              "/// Complete response convenience type built on top of the streaming runtime.\n#[derive(Debug, Clone)]\npub struct BufferedResponse {\n    /// HTTP response status and headers.\n    pub head: ResponseHead,\n    /// Complete logical response body.\n    pub body: Bytes,\n}\n\n",
+              "",
+              "obsolete BufferedResponse",
+          )
+          runtime = replace_exact(
+              runtime,
+              "    /// Request cancellation of the remote transaction.\n    pub fn cancel(&self) {\n        let _ = self.cancel.send(true);\n    }\n\n",
+              "",
+              "duplicate cancel method",
+          )
+          buffered_pattern = re.compile(
+              r"\n    /// Execute a request and collect the response for tests and small control callers\..*?"
+              r"\n    #\[allow\(clippy::too_many_arguments\)\]\n    async fn run_stream\(",
+              re.S,
+          )
+          runtime, count = buffered_pattern.subn(
+              "\n    #[allow(clippy::too_many_arguments)]\n    async fn run_stream(",
+              runtime,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"obsolete buffered request path: expected one match, found {count}")
+          runtime = replace_exact(
+              runtime,
+              "    #[allow(clippy::too_many_arguments)]\n    async fn run_stream_inner(\n",
+              "    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]\n    async fn run_stream_inner(\n",
+              "stream-loop lint scope",
+          )
+          runtime = replace_exact(
+              runtime,
+              """        if let Err(error) = &result {
+            if let Ok(cancel_frame) = encode_cancel(
+                transaction_id,
+                &veilid_http_stream::Cancel {
+                    reason: error.to_string(),
+                },
+            ) {
+                let _ = self
+                    .transport
+                    .app_message(&server_target, cancel_frame)
+                    .await;
+            }
+        }
+""",
+              """        if let Err(error) = &result
+            && let Ok(cancel_frame) = encode_cancel(
+                transaction_id,
+                &veilid_http_stream::Cancel {
+                    reason: error.to_string(),
+                },
+            )
+        {
+            let _ = self
+                .transport
+                .app_message(&server_target, cancel_frame)
+                .await;
+        }
+""",
+              "collapsed cancel send",
+          )
+          runtime = replace_exact(
+              runtime,
+              """                    match chunk {
+                        Some(chunk) => {
+                            request_bytes = request_bytes
+                                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                                .ok_or_else(|| anyhow::anyhow!("request length overflow"))?;
+                            if self.max_request_bytes != 0 && request_bytes > self.max_request_bytes {
+                                bail!("request body exceeds configured client limit");
+                            }
+                            let sender = request_sender
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                            let mut offset = 0;
+                            while offset < chunk.len() {
+                                let end = offset
+                                    .saturating_add(sender.max_input_chunk())
+                                    .min(chunk.len());
+                                sender.push(&chunk[offset..end], false)?;
+                                offset = end;
+                            }
+                            if let Some(credits) = request_credits.as_ref() {
+                                let _ = credits.send(1).await;
+                            }
+                        }
+                        None => {
+                            let sender = request_sender
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                            sender.finish_input()?;
+                            request_finished = true;
+                        }
+                    }
+""",
+              """                    if let Some(chunk) = chunk {
+                        request_bytes = request_bytes
+                            .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                            .ok_or_else(|| anyhow::anyhow!("request length overflow"))?;
+                        if self.max_request_bytes != 0 && request_bytes > self.max_request_bytes {
+                            bail!("request body exceeds configured client limit");
+                        }
+                        let sender = request_sender
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                        let mut offset = 0;
+                        while offset < chunk.len() {
+                            let end = offset
+                                .saturating_add(sender.max_input_chunk())
+                                .min(chunk.len());
+                            sender.push(&chunk[offset..end], false)?;
+                            offset = end;
+                        }
+                        if let Some(credits) = request_credits.as_ref() {
+                            let _ = credits.send(1).await;
+                        }
+                    } else {
+                        let sender = request_sender
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("request body channel exists without sender"))?;
+                        sender.finish_input()?;
+                        request_finished = true;
+                    }
+""",
+              "request input destructuring",
+          )
+          runtime_path.write_text(runtime)
+
+          main_path = Path("apps/veilid-http-native/src/main.rs")
+          main = main_path.read_text()
+          main = replace_exact(main, "enum Request {\n", "enum Command {\n", "IPC command enum")
+          main = main.replace("Request::", "Command::")
+          main = main.replace("request: Request,", "request: Command,")
+          main = main.replace("decode_metadata::<Request>()", "decode_metadata::<Command>()")
+          main = replace_exact(
+              main,
+              "struct Environment {\n",
+              "struct ClientEnvironment {\n",
+              "environment metadata type",
+          )
+          main = replace_exact(
+              main,
+              "success(Environment {\n",
+              "success(ClientEnvironment {\n",
+              "environment metadata construction",
+          )
+          main = replace_exact(
+              main,
+              "#[allow(clippy::too_many_arguments)]\nasync fn start_http_request(\n",
+              "#[allow(clippy::too_many_arguments, clippy::too_many_lines)]\nasync fn start_http_request(\n",
+              "HTTP request loop lint scope",
+          )
+          main = replace_exact(
+              main,
+              "async fn serve_connection<S>(stream: S, state: Arc<State>, expected_secret: &str) -> Result<()>\n",
+              "#[allow(clippy::too_many_lines)]\nasync fn serve_connection<S>(stream: S, state: Arc<State>, expected_secret: &str) -> Result<()>\n",
+              "IPC connection loop lint scope",
+          )
+          main = replace_exact(
+              main,
+              "success(metadata).unwrap_or_else(|error| failure(error))",
+              "success(metadata).unwrap_or_else(failure)",
+              "redundant response closure",
+          )
+          main_path.write_text(main)
+          PY
+
+          cargo fmt --all
+          cargo generate-lockfile
+      - name: Commit cleanup and remove helper
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock crates/veilid-http-veilid-remote/src/lib.rs apps/veilid-http-native/src/runtime.rs apps/veilid-http-native/src/main.rs
+          git commit -m "Clean native sidecar and remote result handling"
+          git rm .github/workflows/fix-native-remote-cleanup.yml
+          git commit -m "Remove one-shot Rust cleanup workflow"
+          git push origin HEAD:agent/complete-veilid-http
+      - name: Verify committed Rust workspace
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
