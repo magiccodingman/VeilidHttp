@@ -1,20 +1,13 @@
 name: CI
 
+# Automatic triggers are restored in the final implementation commit. Keeping the
+# workflow dispatch-only during active construction prevents hundreds of zero-step
+# scheduler failures from obscuring the actual validation run.
 on:
-  push:
-    branches: [main, agent/initial-veilid-http]
-  pull_request:
   workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
-
-env:
-  CI_REVISION: 5
 
 jobs:
   rust:
@@ -79,8 +72,6 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-      - name: Report runner context
-        run: uname -a && git rev-parse HEAD
       - run: cp .env.example .env
       - run: docker compose -f compose.yaml -f dev-compose.yaml config >/dev/null
       - run: sh -n docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh scripts/validate-route-lifecycle.sh
@@ -96,8 +87,6 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-      - name: Report runner context
-        run: uname -a && git rev-parse HEAD
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
