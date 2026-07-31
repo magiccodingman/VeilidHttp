@@ -451,15 +451,18 @@ impl StreamingBridge {
             if let Err(error) = self.completion.record(id, None).await {
                 tracing::error!(%error, transaction = %hex_transaction(id), "failed to persist cancelled transaction tombstone");
             }
-        } else if matches!(
-            self.completion.lookup(id).await,
-            Some(
-                CompletionLookup::Response(_)
-                    | CompletionLookup::Tombstone
-                    | CompletionLookup::InFlight
-            )
-        ) {
-            tracing::debug!(transaction = %hex_transaction(id), "ignored cancellation for completed transaction");
+        } else {
+            match self.completion.lookup(id).await {
+                Some(CompletionLookup::Response(response)) => tracing::debug!(
+                    transaction = %hex_transaction(id),
+                    retained_response_bytes = response.len(),
+                    "ignored cancellation for completed transaction with retained response"
+                ),
+                Some(CompletionLookup::Tombstone | CompletionLookup::InFlight) => {
+                    tracing::debug!(transaction = %hex_transaction(id), "ignored cancellation for completed transaction");
+                }
+                None => {}
+            }
         }
     }
 
@@ -560,6 +563,7 @@ impl StreamingBridge {
         let deadline = tokio::time::sleep(self.config.overall_timeout);
         tokio::pin!(deadline);
         let mut response_stream = response.bytes_stream();
+        let mut response_bytes = 0_u64;
         loop {
             self.dispatch_ready(&transaction).await?;
             let backpressured = transaction
@@ -580,7 +584,17 @@ impl StreamingBridge {
             tokio::select! {
                 item = response_stream.next() => {
                     match item {
-                        Some(Ok(chunk)) => self.push_response_chunk(&transaction, &chunk).await?,
+                        Some(Ok(chunk)) => {
+                            response_bytes = response_bytes
+                                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                                .ok_or_else(|| anyhow::anyhow!("response length overflow"))?;
+                            if self.config.max_response_bytes != 0
+                                && response_bytes > self.config.max_response_bytes
+                            {
+                                bail!("response body exceeds configured bridge limit");
+                            }
+                            self.push_response_chunk(&transaction, &chunk).await?;
+                        }
                         Some(Err(error)) => return Err(error).context("read streamed upstream response"),
                         None => break,
                     }
