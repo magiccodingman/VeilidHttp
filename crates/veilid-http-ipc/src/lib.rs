@@ -12,6 +12,8 @@ const HEADER_LEN: usize = 24;
 pub const MAX_METADATA_BYTES: usize = 256 * 1024;
 /// Maximum payload in one local IPC frame. Streams use multiple frames.
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum credits accepted in one flow-control update.
+pub const MAX_STREAM_CREDITS: u32 = 64;
 
 /// IPC frame semantic type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,8 @@ pub enum FrameKind {
     Cancel = 6,
     /// Asynchronous sidecar event.
     Event = 7,
+    /// Add per-request response-stream delivery credits.
+    StreamCredit = 8,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -45,6 +49,7 @@ impl TryFrom<u8> for FrameKind {
             5 => Ok(Self::StreamEnd),
             6 => Ok(Self::Cancel),
             7 => Ok(Self::Event),
+            8 => Ok(Self::StreamCredit),
             other => Err(IpcError::UnknownKind(other)),
         }
     }
@@ -198,6 +203,27 @@ pub struct Hello {
     pub secret: String,
 }
 
+/// Per-request stream delivery credit update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCredit {
+    /// Additional body chunks the receiver is ready to accept.
+    pub credits: u32,
+}
+
+impl StreamCredit {
+    /// Validate that a credit update is useful and bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero or excessive credit counts.
+    pub fn validate(self) -> Result<Self, IpcError> {
+        if self.credits == 0 || self.credits > MAX_STREAM_CREDITS {
+            return Err(IpcError::InvalidStreamCredits(self.credits));
+        }
+        Ok(self)
+    }
+}
+
 /// IPC framing failures.
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -219,6 +245,9 @@ pub enum IpcError {
     /// Raw frame payload is too large.
     #[error("IPC payload length {0} exceeds its bound")]
     PayloadTooLarge(usize),
+    /// Stream credit count is zero or exceeds the protocol bound.
+    #[error("invalid IPC stream credit count {0}")]
+    InvalidStreamCredits(u32),
     /// Metadata serialization failed.
     #[error("IPC metadata encoding failed: {0}")]
     MetadataEncode(String),
@@ -247,5 +276,18 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(received, expected);
         assert_eq!(received.decode_metadata::<Hello>().unwrap().secret, "secret");
+    }
+
+    #[test]
+    fn stream_credit_is_bounded() {
+        assert!(StreamCredit { credits: 1 }.validate().is_ok());
+        assert!(matches!(
+            StreamCredit { credits: 0 }.validate(),
+            Err(IpcError::InvalidStreamCredits(0))
+        ));
+        assert!(matches!(
+            StreamCredit { credits: MAX_STREAM_CREDITS + 1 }.validate(),
+            Err(IpcError::InvalidStreamCredits(_))
+        ));
     }
 }
