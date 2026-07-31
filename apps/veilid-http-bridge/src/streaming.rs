@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::{StreamExt as _, stream};
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -55,14 +56,6 @@ impl StreamingConfig {
             u64::MAX
         } else {
             self.max_request_bytes
-        }
-    }
-
-    fn response_limit(&self) -> u64 {
-        if self.max_response_bytes == 0 {
-            u64::MAX
-        } else {
-            self.max_response_bytes
         }
     }
 }
@@ -470,6 +463,7 @@ impl StreamingBridge {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_upstream(
         &self,
         transaction_id: [u8; 16],
@@ -765,5 +759,9 @@ fn split_frames(payload: Bytes) -> Result<Vec<Bytes>> {
 }
 
 fn hex_transaction(id: [u8; 16]) -> String {
-    id.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut encoded = String::with_capacity(32);
+    for byte in id {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
