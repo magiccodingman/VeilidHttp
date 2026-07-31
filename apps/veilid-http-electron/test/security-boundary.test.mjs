@@ -64,7 +64,7 @@ test('packaged builds always launch the bundled native transport executable', as
 
 test('packaged Electron binaries disable command-line execution escape hatches', async () => {
   const forge = await source('forge.config.ts');
-  assert.match(forge, /flipFuses/);
+  assert.match(forge, /new FusesPlugin/);
   assert.match(forge, /\[FuseV1Options\.RunAsNode\]: false/);
   assert.match(forge, /\[FuseV1Options\.EnableNodeOptionsEnvironmentVariable\]: false/);
   assert.match(forge, /\[FuseV1Options\.EnableNodeCliInspectArguments\]: false/);
