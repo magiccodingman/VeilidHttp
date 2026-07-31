@@ -11,15 +11,18 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   electron-lock:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout source
+      - name: Checkout source branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -29,11 +32,6 @@ jobs:
           run_install: false
       - name: Generate updated lockfile
         run: pnpm install --lockfile-only --no-frozen-lockfile
-      - name: Upload tested lockfile
-        uses: actions/upload-artifact@v4
-        with:
-          name: hardened-pnpm-lock
-          path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
@@ -54,3 +52,15 @@ jobs:
           binary="$app_dir/veilid-http"
           test -x "$binary"
           pnpm --filter @veilid-http/electron exec electron-fuses read --app "$binary"
+      - name: Commit tested lockfile
+        if: github.event_name == 'pull_request' && github.head_ref == 'agent/complete-veilid-http'
+        run: |
+          git config user.name 'veilid-http-ci'
+          git config user.email 'veilid-http-ci@users.noreply.github.com'
+          git add pnpm-lock.yaml
+          if git diff --cached --quiet; then
+            echo 'Lockfile is already current'
+            exit 0
+          fi
+          git commit -m 'Lock Electron fuse hardening dependencies'
+          git push origin HEAD:${GITHUB_HEAD_REF}
