@@ -71,13 +71,29 @@ jobs:
         run: pnpm --filter @veilid-http/electron package -- --platform=linux --arch=x64
       - name: Report packaged Electron fuses
         run: |
-          app_dir="$(find apps/veilid-http-electron/out -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
-          test -n "$app_dir"
-          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$app_dir"
+          app_dir="$(find "$GITHUB_WORKSPACE/apps/veilid-http-electron/out" -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
+          binary="$app_dir/veilid-http"
+          test -x "$binary"
+          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$binary"
       - name: Commit tested lock and restore read-only CI
         if: github.event_name == 'pull_request' && github.head_ref == 'agent/complete-veilid-http'
         run: |
           git show a474919d2bb477880dc5129ccfacc6e3a581adcb:.github/workflows/ci.yml > .github/workflows/ci.yml
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/ci.yml')
+          text = path.read_text()
+          old = '''          app_dir="$(find apps/veilid-http-electron/out -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
+          test -n "$app_dir"
+          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$app_dir"'''
+          new = '''          app_dir="$(find "$GITHUB_WORKSPACE/apps/veilid-http-electron/out" -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
+          binary="$app_dir/veilid-http"
+          test -x "$binary"
+          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$binary"'''
+          if old not in text:
+              raise SystemExit('expected final CI fuse block not found')
+          path.write_text(text.replace(old, new))
+          PY
           git config user.name 'veilid-http-ci'
           git config user.email 'veilid-http-ci@users.noreply.github.com'
           git add pnpm-lock.yaml .github/workflows/ci.yml
