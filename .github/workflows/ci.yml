@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, agent/finish-live-integration]
+    branches: [main, agent/complete-veilid-http]
   pull_request:
   workflow_dispatch:
 
@@ -11,9 +11,46 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  normalize-branch:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/complete-veilid-http'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout completion branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/complete-veilid-http
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+          run_install: false
+      - name: Normalize source and lockfiles
+        run: |
+          cargo generate-lockfile
+          cargo fmt --all
+          pnpm install --lockfile-only --frozen-lockfile=false
+      - name: Commit normalized repository state
+        run: |
+          if git diff --quiet --exit-code -- '*.rs' Cargo.lock pnpm-lock.yaml; then
+            echo "Repository state is already normalized."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.rs' Cargo.lock pnpm-lock.yaml
+          git commit -m "Normalize Rust sources and lockfiles"
+          git push origin HEAD:agent/complete-veilid-http
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -28,32 +65,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo metadata --no-deps --format-version 1 >/dev/null
-      - name: Check Rust formatting
-        id: rustfmt
-        shell: bash
-        run: |
-          if ! cargo fmt --all --check; then
-            cargo fmt --all
-            git diff --binary -- '*.rs' > rustfmt.patch
-            cat rustfmt.patch
-            exit 1
-          fi
-      - name: Preserve rustfmt patch
-        if: failure() && steps.rustfmt.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-patch
-          path: rustfmt.patch
-          if-no-files-found: ignore
+      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
-      - name: Preserve generated Cargo lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lock
-          path: Cargo.lock
-          if-no-files-found: ignore
 
   electron:
     runs-on: ubuntu-latest
@@ -71,20 +85,13 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
       - name: Verify service workers, storage, CORS, and streams on veilid://
-        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron test/electron-pwa-smoke.cjs
+        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
-      - name: Preserve generated pnpm lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pnpm-lock
-          path: pnpm-lock.yaml
-          if-no-files-found: ignore
 
   compose:
     runs-on: ubuntu-latest
@@ -95,17 +102,6 @@ jobs:
       - run: cp .env.example .env
       - run: docker compose -f compose.yaml -f dev-compose.yaml config >/dev/null
       - run: sh -n docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh scripts/validate-route-lifecycle.sh
-      - name: Pack temporary workspace snapshot
-        if: always()
-        run: tar --exclude=.git --exclude=node_modules --exclude=target -czf /tmp/veilid-http-workspace.tgz .
-      - name: Preserve temporary workspace snapshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent-workspace-snapshot
-          path: /tmp/veilid-http-workspace.tgz
-          if-no-files-found: error
-          retention-days: 1
 
   docker-build:
     runs-on: ubuntu-latest
