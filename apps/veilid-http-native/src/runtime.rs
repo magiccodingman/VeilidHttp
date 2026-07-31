@@ -14,8 +14,8 @@ use veilid_http_core::RetryPolicy;
 use veilid_http_engine::{InboundBody, OutboundBody};
 use veilid_http_http::{RequestHead, ResponseHead};
 use veilid_http_stream::{
-    CompressionMode, DecodedFrame, RequestOpen, StreamDirection, decode, encode_ack,
-    encode_cancel, encode_request_open,
+    CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode,
+    encode_ack, encode_cancel, encode_request_open,
 };
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_native::NativeVeilidTransport;
@@ -275,18 +275,17 @@ impl ClientRuntime {
             .await;
         self.transactions.lock().await.remove(&transaction_id);
         if let Err(error) = &result {
-            let _ = self
-                .transport
-                .app_message(
-                    &server_target,
-                    encode_cancel(
-                        transaction_id,
-                        &veilid_http_stream::Cancel {
-                            reason: error.to_string(),
-                        },
-                    )?,
-                )
-                .await;
+            if let Ok(cancel_frame) = encode_cancel(
+                transaction_id,
+                &veilid_http_stream::Cancel {
+                    reason: error.to_string(),
+                },
+            ) {
+                let _ = self
+                    .transport
+                    .app_message(&server_target, cancel_frame)
+                    .await;
+            }
         }
         result
     }
@@ -321,7 +320,7 @@ impl ClientRuntime {
             .app_call(server_target, opening)
             .await
             .context("open streamed VHTTP request")?;
-        match decode(reply)? {
+        let request_receive_window = match decode(reply)? {
             DecodedFrame::RequestAccepted {
                 transaction_id: reply_id,
                 value,
@@ -329,15 +328,16 @@ impl ClientRuntime {
                 if reply_id != transaction_id {
                     bail!("RequestAccepted transaction identifier mismatch");
                 }
-                if value.request_receive_window > 64 {
+                if value.request_receive_window == 0 || value.request_receive_window > 64 {
                     bail!("server returned an invalid request receive window");
                 }
+                value.request_receive_window
             }
             DecodedFrame::Error { value, .. } => {
                 bail!("server rejected RequestOpen: {}: {}", value.code, value.message);
             }
             other => bail!("unexpected streamed AppCall reply: {other:?}"),
-        }
+        };
 
         let mut request_sender = if has_body {
             let mut sender = OutboundBody::new(
@@ -350,7 +350,7 @@ impl ClientRuntime {
                 self.window_frames,
                 self.max_pending_bytes,
             )?;
-            sender.set_peer_window(u32::try_from(self.window_frames).unwrap_or(32))?;
+            sender.set_peer_window(request_receive_window)?;
             Some(sender)
         } else {
             None
@@ -399,16 +399,28 @@ impl ClientRuntime {
                             if !initial_payload.is_empty() {
                                 bail!("ResponseOpen initial payload is reserved until sequenced initial-data support is enabled");
                             }
+                            let ResponseOpen {
+                                head,
+                                response_compression,
+                                response_body,
+                                request_receive_window,
+                            } = value;
+                            if request_receive_window > 64 {
+                                bail!("server returned an invalid updated request receive window");
+                            }
+                            if let Some(sender) = request_sender.as_mut() {
+                                sender.set_peer_window(request_receive_window)?;
+                            }
                             response_events
-                                .send(ClientResponseEvent::Head(value.head))
+                                .send(ClientResponseEvent::Head(head))
                                 .await
                                 .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
                             response_head_sent = true;
-                            if value.response_body {
+                            if response_body {
                                 response_receiver = Some(InboundBody::new(
                                     transaction_id,
                                     StreamDirection::Response,
-                                    value.response_compression,
+                                    response_compression,
                                     u32::try_from(self.window_frames).unwrap_or(32),
                                     self.max_out_of_order_bytes,
                                     if self.max_response_bytes == 0 { u64::MAX } else { self.max_response_bytes },
