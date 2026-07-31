@@ -1,9 +1,9 @@
 name: CI
 
-# Automatic triggers are restored in the final implementation commit. Keeping the
-# workflow dispatch-only during active construction prevents hundreds of zero-step
-# scheduler failures from obscuring the actual validation run.
 on:
+  push:
+    branches: [main, agent/initial-veilid-http]
+  pull_request:
   workflow_dispatch:
 
 permissions:
