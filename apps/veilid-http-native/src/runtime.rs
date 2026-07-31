@@ -24,6 +24,7 @@ use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
 const REQUEST_INPUT_CHANNEL_FRAMES: usize = 4;
 
 /// Complete response convenience type built on top of the streaming runtime.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BufferedResponse {
     /// HTTP response status and headers.
@@ -61,6 +62,7 @@ pub struct ClientRequest {
 
 impl ClientRequest {
     /// Request cancellation of the remote transaction.
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
     }
@@ -264,6 +266,7 @@ impl ClientRuntime {
     /// # Errors
     ///
     /// Returns any error surfaced by the streaming runtime.
+    #[allow(dead_code)]
     pub async fn request_buffered(
         self: &Arc<Self>,
         server_target: &RouteTarget,
