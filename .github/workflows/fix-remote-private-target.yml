@@ -1,0 +1,50 @@
+name: Fix remote private-route targets
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.head_ref == 'agent/complete-veilid-http'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Use explicit private-route targets
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/veilid-http-veilid-remote/src/lib.rs')
+          text = path.read_text()
+          replacements = [
+              (
+                  'use veilid_core::{OperationId, RouteId, VeilidAPIError, VeilidUpdate};',
+                  'use veilid_core::{OperationId, RouteId, Target, VeilidAPIError, VeilidUpdate};',
+              ),
+              (
+                  'target: parse_route(target)?.into(),',
+                  'target: Target::PrivateRoute(parse_route(target)?),',
+              ),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f'expected remote adapter text not found: {old}')
+              text = text.replace(old, new, 1)
+          old = 'target: parse_route(target)?.into(),'
+          new = 'target: Target::PrivateRoute(parse_route(target)?),'
+          if old not in text:
+              raise SystemExit('second remote adapter target was not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Commit fix and remove helper
+        run: |
+          git rm .github/workflows/fix-remote-private-target.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/veilid-http-veilid-remote/src/lib.rs
+          git commit -m "Use explicit remote private-route targets"
+          git push origin HEAD:agent/complete-veilid-http
