@@ -109,8 +109,8 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         let mut sent = sender.take_sendable(now, policy);
         sent.reverse();
         for retained in sent {
-            let (DecodedFrame::Data { sequence, .. }
-            | DecodedFrame::End { sequence, .. }) = decode(retained.encoded.clone()).unwrap()
+            let (DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. }) =
+                decode(retained.encoded.clone()).unwrap()
             else {
                 unreachable!();
             };
