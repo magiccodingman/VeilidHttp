@@ -19,7 +19,8 @@ use tokio::{
 };
 use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_ipc::{
-    FrameKind, Hello, IpcFrame, MAX_STREAM_CREDITS, StreamCredit, read_frame, write_frame,
+    FrameKind, Hello, IpcFrame, IpcStreamDirection, MAX_STREAM_CREDITS, StreamCredit,
+    read_frame, write_frame,
 };
 use veilid_http_transport::RouteTarget;
 use veilid_http_veilid_native::{NativeTransportConfig, NativeVeilidTransport};
@@ -239,7 +240,10 @@ async fn forward_request_credits(
             &outbound,
             FrameKind::StreamCredit,
             request_id,
-            &StreamCredit { credits },
+            &StreamCredit {
+                direction: IpcStreamDirection::Request,
+                credits,
+            },
             Bytes::new(),
         )
         .await
@@ -316,6 +320,7 @@ async fn start_http_request(
             FrameKind::StreamCredit,
             request_id,
             &StreamCredit {
+                direction: IpcStreamDirection::Request,
                 credits: initial_request_credits,
             },
             Bytes::new(),
@@ -613,6 +618,17 @@ where
                         continue;
                     }
                 };
+                if credit.direction != IpcStreamDirection::Response {
+                    queue_response(
+                        &outbound,
+                        FrameKind::Cancel,
+                        frame.request_id,
+                        &failure("Electron sent upload-direction credits to the response stream"),
+                        Bytes::new(),
+                    )
+                    .await?;
+                    continue;
+                }
                 let response_credits = active
                     .lock()
                     .await
