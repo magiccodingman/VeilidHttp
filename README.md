@@ -66,7 +66,7 @@ expose arbitrary TCP or UDP tunnels. WebSockets, SignalR, WebTransport, and HTTP
 - `apps/veilid-http-cli`: route/status/export tooling.
 - `samples/`: static PWA and SSR/streaming compatibility fixtures.
 
-Both Veilid adapters construct explicit `Target::PrivateRoute` destinations for
+Both Veilid 0.5.5 adapters construct explicit `Target::RouteId` destinations for
 AppCall/AppMessage traffic. A RouteId is never treated as a node target or left to an
 implicit conversion.
 
