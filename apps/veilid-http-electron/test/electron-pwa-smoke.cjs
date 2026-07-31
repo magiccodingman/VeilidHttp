@@ -2,32 +2,22 @@ const assert = require('node:assert/strict');
 const {
   app,
   BrowserWindow,
-  protocol,
   session,
 } = require('electron');
 
 const SITE_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaa';
 const SITE_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbb';
-const ORIGIN_A = `veilid://${SITE_A}`;
-const ORIGIN_B = `veilid://${SITE_B}`;
-
-protocol.registerSchemesAsPrivileged([
-  {
-    scheme: 'veilid',
-    privileges: {
-      standard: true,
-      secure: true,
-      supportFetchAPI: true,
-      corsEnabled: true,
-      allowServiceWorkers: true,
-      stream: true,
-      codeCache: true,
-    },
-  },
-]);
+const ORIGIN_A = `http://${SITE_A}.veilid.localhost`;
+const ORIGIN_B = `http://${SITE_B}.veilid.localhost`;
 
 function responseFor(request) {
   const url = new URL(request.url);
+  if (![`${SITE_A}.veilid.localhost`, `${SITE_B}.veilid.localhost`].includes(url.hostname)) {
+    return new Response('plaintext HTTP outside the virtual Veilid origins is blocked', {
+      status: 403,
+      headers: { 'content-type': 'text/plain' },
+    });
+  }
   if (url.pathname === '/sw.js') {
     return new Response(`
       self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
@@ -96,7 +86,7 @@ async function waitForServiceWorker(window) {
     if (ready) return;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error('service worker did not become ready on the veilid scheme');
+  throw new Error('service worker did not become ready on the VeilidHttp localhost origin');
 }
 
 async function browserAssertions(window) {
@@ -149,6 +139,7 @@ async function browserAssertions(window) {
       streamDone: done.done,
       wasm: typeof WebAssembly === 'object',
       secureContext: isSecureContext,
+      origin: location.origin,
     };
   })()`, true);
 }
@@ -156,7 +147,7 @@ async function browserAssertions(window) {
 app.whenReady().then(async () => {
   const partitionName = `persist:veilid-pwa-smoke-${process.pid}`;
   const targetSession = session.fromPartition(partitionName, { cache: true });
-  targetSession.protocol.handle('veilid', responseFor);
+  targetSession.protocol.handle('http', responseFor);
   const window = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -184,6 +175,7 @@ app.whenReady().then(async () => {
     assert.equal(result.streamDone, true);
     assert.equal(result.wasm, true);
     assert.equal(result.secureContext, true);
+    assert.equal(result.origin, ORIGIN_A);
 
     window.destroy();
     const reopened = new BrowserWindow({
