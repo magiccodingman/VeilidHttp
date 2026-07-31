@@ -62,12 +62,16 @@ test('packaged builds always launch the bundled native transport executable', as
   assert.match(sidecar, /shell:\s*false/);
 });
 
-test('packaged Electron binaries disable command-line execution escape hatches', async () => {
+test('packaged Electron binaries apply the complete restrictive fuse policy', async () => {
   const forge = await source('forge.config.ts');
   assert.match(forge, /new FusesPlugin/);
+  assert.match(forge, /strictlyRequireAllFuses:\s*true/);
   assert.match(forge, /\[FuseV1Options\.RunAsNode\]: false/);
+  assert.match(forge, /\[FuseV1Options\.EnableCookieEncryption\]: true/);
   assert.match(forge, /\[FuseV1Options\.EnableNodeOptionsEnvironmentVariable\]: false/);
   assert.match(forge, /\[FuseV1Options\.EnableNodeCliInspectArguments\]: false/);
   assert.match(forge, /\[FuseV1Options\.EnableEmbeddedAsarIntegrityValidation\]: true/);
   assert.match(forge, /\[FuseV1Options\.OnlyLoadAppFromAsar\]: true/);
+  assert.match(forge, /\[FuseV1Options\.LoadBrowserProcessSpecificV8Snapshot\]: true/);
+  assert.match(forge, /\[FuseV1Options\.GrantFileProtocolExtraPrivileges\]: false/);
 });
