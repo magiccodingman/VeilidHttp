@@ -1,89 +1,91 @@
 const assert = require('node:assert/strict');
+const http = require('node:http');
+const { Readable } = require('node:stream');
 const {
   app,
   BrowserWindow,
-  protocol,
   session,
 } = require('electron');
 
 const SITE_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaa';
 const SITE_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbb';
-const ORIGIN_A = `veilid://${SITE_A}`;
-const ORIGIN_B = `veilid://${SITE_B}`;
 
-protocol.registerSchemesAsPrivileged([
-  {
-    scheme: 'veilid',
-    privileges: {
-      standard: true,
-      secure: true,
-      supportFetchAPI: true,
-      corsEnabled: true,
-      allowServiceWorkers: true,
-      stream: true,
-      codeCache: true,
-    },
-  },
-]);
-
-function responseFor(request) {
-  const url = new URL(request.url);
-  if (url.pathname === '/sw.js') {
-    return new Response(`
-      self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
-      self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-      self.addEventListener('fetch', event => {
-        const url = new URL(event.request.url);
-        if (url.pathname === '/worker-data') {
-          event.respondWith(new Response('service-worker-response', {
-            headers: { 'content-type': 'text/plain' }
-          }));
-        }
-      });
-    `, {
-      headers: {
+function createFixtureServer() {
+  return http.createServer((request, response) => {
+    const host = request.headers.host ?? '';
+    const port = response.socket.localPort;
+    const originA = `http://${SITE_A}.veilid.localhost:${port}`;
+    const pathname = new URL(request.url ?? '/', originA).pathname;
+    if (pathname === '/sw.js') {
+      response.writeHead(200, {
         'content-type': 'text/javascript; charset=utf-8',
         'cache-control': 'no-store',
-      },
-    });
-  }
-  if (url.pathname === '/cors-ok') {
-    return new Response('cors-ok', {
-      headers: {
+      });
+      response.end(`
+        self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
+        self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
+        self.addEventListener('fetch', event => {
+          const url = new URL(event.request.url);
+          if (url.pathname === '/worker-data') {
+            event.respondWith(new Response('service-worker-response', {
+              headers: { 'content-type': 'text/plain' }
+            }));
+          }
+        });
+      `);
+      return;
+    }
+    if (pathname === '/cors-ok') {
+      response.writeHead(200, {
         'content-type': 'text/plain',
-        'access-control-allow-origin': ORIGIN_A,
-      },
-    });
-  }
-  if (url.pathname === '/cors-denied') {
-    return new Response('cors-denied', {
-      headers: { 'content-type': 'text/plain' },
-    });
-  }
-  if (url.pathname === '/stream') {
-    const encoder = new TextEncoder();
-    const body = new ReadableStream({
-      async start(controller) {
-        controller.enqueue(encoder.encode('first-'));
+        'access-control-allow-origin': originA,
+      });
+      response.end('cors-ok');
+      return;
+    }
+    if (pathname === '/cors-denied') {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.end('cors-denied');
+      return;
+    }
+    if (pathname === '/stream') {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      Readable.from((async function* stream() {
+        yield 'first-';
         await new Promise(resolve => setTimeout(resolve, 25));
-        controller.enqueue(encoder.encode('second'));
-        controller.close();
-      },
-    });
-    return new Response(body, {
-      headers: { 'content-type': 'text/plain' },
-    });
-  }
-  return new Response(`<!doctype html>
-    <meta charset="utf-8">
-    <title>VeilidHttp PWA smoke</title>
-    <script>
-      window.registrationReady = navigator.serviceWorker.register('/sw.js')
-        .then(() => navigator.serviceWorker.ready)
-        .then(() => true);
-    </script>`, {
-    headers: { 'content-type': 'text/html; charset=utf-8' },
+        yield 'second';
+      })()).pipe(response);
+      return;
+    }
+    if (!host.startsWith(`${SITE_A}.`) && !host.startsWith(`${SITE_B}.`)) {
+      response.writeHead(400);
+      response.end('invalid host');
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end(`<!doctype html>
+      <meta charset="utf-8">
+      <title>VeilidHttp PWA smoke</title>
+      <script>
+        window.registrationReady = navigator.serviceWorker.register('/sw.js')
+          .then(() => navigator.serviceWorker.ready)
+          .then(() => true);
+      </script>`);
   });
+}
+
+async function listen(server) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('fixture server has no TCP port');
+  return address.port;
+}
+
+async function close(server) {
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
 async function waitForServiceWorker(window) {
@@ -96,10 +98,10 @@ async function waitForServiceWorker(window) {
     if (ready) return;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error('service worker did not become ready on the veilid scheme');
+  throw new Error('service worker did not become ready on the loopback origin');
 }
 
-async function browserAssertions(window) {
+async function browserAssertions(window, originB) {
   return window.webContents.executeJavaScript(`(async () => {
     const cache = await caches.open('pwa-smoke');
     await cache.put('/cached', new Response('cached-value'));
@@ -123,10 +125,10 @@ async function browserAssertions(window) {
 
     const controlled = Boolean(navigator.serviceWorker.controller);
     const workerResponse = await fetch('/worker-data').then(response => response.text());
-    const corsAllowed = await fetch('${ORIGIN_B}/cors-ok').then(response => response.text());
+    const corsAllowed = await fetch('${originB}/cors-ok').then(response => response.text());
     let corsDenied = false;
     try {
-      await fetch('${ORIGIN_B}/cors-denied');
+      await fetch('${originB}/cors-denied');
     } catch {
       corsDenied = true;
     }
@@ -134,9 +136,13 @@ async function browserAssertions(window) {
     const streamResponse = await fetch('/stream');
     const reader = streamResponse.body.getReader();
     const decoder = new TextDecoder();
-    const first = await reader.read();
-    const second = await reader.read();
-    const done = await reader.read();
+    let streamed = '';
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      streamed += decoder.decode(part.value, { stream: true });
+    }
+    streamed += decoder.decode();
 
     return {
       cached,
@@ -145,8 +151,7 @@ async function browserAssertions(window) {
       workerResponse,
       corsAllowed,
       corsDenied,
-      streamed: decoder.decode(first.value) + decoder.decode(second.value),
-      streamDone: done.done,
+      streamed,
       wasm: typeof WebAssembly === 'object',
       secureContext: isSecureContext,
     };
@@ -154,9 +159,12 @@ async function browserAssertions(window) {
 }
 
 app.whenReady().then(async () => {
+  const server = createFixtureServer();
+  const port = await listen(server);
+  const originA = `http://${SITE_A}.veilid.localhost:${port}`;
+  const originB = `http://${SITE_B}.veilid.localhost:${port}`;
   const partitionName = `persist:veilid-pwa-smoke-${process.pid}`;
   const targetSession = session.fromPartition(partitionName, { cache: true });
-  targetSession.protocol.handle('veilid', responseFor);
   const window = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -169,11 +177,11 @@ app.whenReady().then(async () => {
   });
 
   try {
-    await window.loadURL(`${ORIGIN_A}/`);
+    await window.loadURL(`${originA}/`);
     await waitForServiceWorker(window);
     await window.webContents.reload();
     await waitForServiceWorker(window);
-    const result = await browserAssertions(window);
+    const result = await browserAssertions(window, originB);
     assert.equal(result.cached, 'cached-value');
     assert.equal(result.indexed, 'indexed-value');
     assert.equal(result.controlled, true);
@@ -181,7 +189,6 @@ app.whenReady().then(async () => {
     assert.equal(result.corsAllowed, 'cors-ok');
     assert.equal(result.corsDenied, true);
     assert.equal(result.streamed, 'first-second');
-    assert.equal(result.streamDone, true);
     assert.equal(result.wasm, true);
     assert.equal(result.secureContext, true);
 
@@ -196,7 +203,7 @@ app.whenReady().then(async () => {
         webSecurity: true,
       },
     });
-    await reopened.loadURL(`${ORIGIN_A}/`);
+    await reopened.loadURL(`${originA}/`);
     const persisted = await reopened.webContents.executeJavaScript(
       `caches.open('pwa-smoke').then(cache => cache.match('/cached')).then(response => response.text())`,
       true,
@@ -204,9 +211,11 @@ app.whenReady().then(async () => {
     assert.equal(persisted, 'cached-value');
     reopened.destroy();
     await targetSession.clearStorageData();
+    await close(server);
     app.exit(0);
   } catch (error) {
     console.error(error);
+    await close(server).catch(() => undefined);
     app.exit(1);
   }
 });

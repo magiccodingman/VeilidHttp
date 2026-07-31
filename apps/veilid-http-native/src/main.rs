@@ -19,8 +19,8 @@ use tokio::{
 };
 use veilid_http_http::{HeaderField, RequestHead};
 use veilid_http_ipc::{
-    FrameKind, Hello, IpcFrame, IpcStreamDirection, MAX_STREAM_CREDITS, StreamCredit,
-    read_frame, write_frame,
+    FrameKind, Hello, IpcFrame, IpcStreamDirection, MAX_STREAM_CREDITS, StreamCredit, read_frame,
+    write_frame,
 };
 use veilid_http_transport::RouteTarget;
 use veilid_http_veilid_native::{NativeTransportConfig, NativeVeilidTransport};
@@ -43,7 +43,11 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum Request {
     Health,
     Fingerprint {
@@ -150,8 +154,8 @@ impl State {
             return Ok(target);
         }
         let path = route_path(&self.data_dir, site_id);
-        let blob = fs::read(&path)
-            .with_context(|| format!("read imported route {}", path.display()))?;
+        let blob =
+            fs::read(&path).with_context(|| format!("read imported route {}", path.display()))?;
         let (fingerprint, target) = self.import_route(Bytes::from(blob)).await?;
         if fingerprint != site_id {
             bail!("persisted RouteBlob fingerprint does not match requested site identifier");
@@ -164,7 +168,10 @@ impl State {
         request: Request,
     ) -> Result<(Response<serde_json::Value>, Bytes)> {
         match request {
-            Request::Health => Ok((success(serde_json::json!({ "status": "ready" }))?, Bytes::new())),
+            Request::Health => Ok((
+                success(serde_json::json!({ "status": "ready" }))?,
+                Bytes::new(),
+            )),
             Request::Environment => Ok((
                 success(Environment {
                     environment: "electron",
@@ -195,7 +202,10 @@ impl State {
             Request::ImportRoute { route_blob_base64 } => {
                 let blob = veilid_http_route::decode_route_blob(&route_blob_base64)?;
                 let (fingerprint, _) = self.import_route(Bytes::from(blob)).await?;
-                Ok((success(serde_json::json!({ "fingerprint": fingerprint }))?, Bytes::new()))
+                Ok((
+                    success(serde_json::json!({ "fingerprint": fingerprint }))?,
+                    Bytes::new(),
+                ))
             }
             Request::HttpRequest { .. } => bail!("HTTP requests use the streaming IPC path"),
         }
@@ -209,7 +219,9 @@ fn secrets_equal(left: &str, right: &str) -> bool {
     left.as_bytes()
         .iter()
         .zip(right.as_bytes())
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -221,7 +233,9 @@ async fn queue_response<T: Serialize>(
     payload: Bytes,
 ) -> Result<()> {
     outbound
-        .send(IpcFrame::from_metadata(kind, request_id, metadata, payload)?)
+        .send(IpcFrame::from_metadata(
+            kind, request_id, metadata, payload,
+        )?)
         .await
         .context("queue IPC response")
 }
@@ -233,7 +247,11 @@ async fn forward_request_credits(
 ) {
     while let Some(credits) = credits.recv().await {
         if credits == 0 || credits > MAX_STREAM_CREDITS {
-            tracing::error!(request_id, credits, "native runtime produced invalid upload credits");
+            tracing::error!(
+                request_id,
+                credits,
+                "native runtime produced invalid upload credits"
+            );
             break;
         }
         if let Err(error) = queue_response(
@@ -328,7 +346,11 @@ async fn start_http_request(
         .await?;
     }
     if let Some(credits) = request_credits {
-        tokio::spawn(forward_request_credits(outbound.clone(), request_id, credits));
+        tokio::spawn(forward_request_credits(
+            outbound.clone(),
+            request_id,
+            credits,
+        ));
     }
 
     tokio::spawn(async move {
@@ -362,14 +384,8 @@ async fn start_http_request(
                     match permit {
                         Ok(permit) => {
                             permit.forget();
-                            queue_response(
-                                &outbound,
-                                FrameKind::StreamData,
-                                request_id,
-                                &(),
-                                chunk,
-                            )
-                            .await
+                            queue_response(&outbound, FrameKind::StreamData, request_id, &(), chunk)
+                                .await
                         }
                         Err(error) => Err(error),
                     }
@@ -394,14 +410,9 @@ async fn start_http_request(
                     } else {
                         FrameKind::Response
                     };
-                    let result = queue_response(
-                        &outbound,
-                        kind,
-                        request_id,
-                        &failure(error),
-                        Bytes::new(),
-                    )
-                    .await;
+                    let result =
+                        queue_response(&outbound, kind, request_id, &failure(error), Bytes::new())
+                            .await;
                     if result.is_ok() {
                         break;
                     }
@@ -430,7 +441,9 @@ where
     if hello.kind != FrameKind::Hello {
         bail!("first IPC frame must authenticate the Electron parent");
     }
-    let supplied = hello.decode_metadata::<Hello>().context("decode IPC hello")?;
+    let supplied = hello
+        .decode_metadata::<Hello>()
+        .context("decode IPC hello")?;
     if !secrets_equal(&supplied.secret, expected_secret) {
         bail!("invalid IPC launch secret");
     }
@@ -707,8 +720,8 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create IPC directory {}", parent.display()))?;
     }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("bind IPC socket {}", path.display()))?;
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("bind IPC socket {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("protect IPC socket {}", path.display()))?;
     let result = async {
@@ -717,7 +730,9 @@ async fn serve(config: &Config, state: Arc<State>) -> Result<()> {
                 .accept()
                 .await
                 .context("accept Electron IPC connection")?;
-            if let Err(error) = serve_connection(stream, Arc::clone(&state), &config.ipc_secret).await {
+            if let Err(error) =
+                serve_connection(stream, Arc::clone(&state), &config.ipc_secret).await
+            {
                 tracing::warn!(%error, "Electron IPC connection ended with an error");
             }
         }

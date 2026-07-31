@@ -35,6 +35,23 @@ impl PendingItem {
     }
 }
 
+/// Configuration for one bounded outgoing logical body stream.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundBodyConfig {
+    /// Per-stream compression mode.
+    pub compression: CompressionMode,
+    /// Zstandard compression level when compression is enabled.
+    pub zstd_level: i32,
+    /// Maximum complete VHTTP frame size.
+    pub frame_limit: usize,
+    /// Bytes reserved for frame metadata when calculating payload capacity.
+    pub reserved_metadata: usize,
+    /// Local frame window, from 1 through 64.
+    pub window_frames: usize,
+    /// Hard bound for pending and retransmission bytes owned by the stream.
+    pub max_pending_bytes: usize,
+}
+
 /// Bounded outgoing logical body stream.
 #[derive(Debug)]
 pub struct OutboundBody {
@@ -65,13 +82,16 @@ impl OutboundBody {
     pub fn new(
         transaction_id: [u8; 16],
         direction: StreamDirection,
-        compression: CompressionMode,
-        zstd_level: i32,
-        frame_limit: usize,
-        reserved_metadata: usize,
-        window_frames: usize,
-        max_pending_bytes: usize,
+        config: OutboundBodyConfig,
     ) -> Result<Self, EngineError> {
+        let OutboundBodyConfig {
+            compression,
+            zstd_level,
+            frame_limit,
+            reserved_metadata,
+            window_frames,
+            max_pending_bytes,
+        } = config;
         if window_frames == 0 || window_frames > 64 {
             return Err(EngineError::InvalidWindow(window_frames));
         }
@@ -80,8 +100,7 @@ impl OutboundBody {
         let minimum_window_bytes = conservative_frame_bytes
             .checked_mul(window_frames)
             .ok_or(EngineError::InvalidPendingBound(max_pending_bytes))?;
-        if max_pending_bytes < minimum_window_bytes
-            || max_pending_bytes < batcher.target_payload()
+        if max_pending_bytes < minimum_window_bytes || max_pending_bytes < batcher.target_payload()
         {
             return Err(EngineError::InvalidPendingBound(max_pending_bytes));
         }
@@ -137,10 +156,8 @@ impl OutboundBody {
             .ok_or(EngineError::AlreadyFinished)?
             .push(logical, flush)?;
         self.queue_compressed(&encoded)?;
-        if flush {
-            if let Some(payload) = self.batcher.flush() {
-                self.queue(PendingItem::Data(payload))?;
-            }
+        if flush && let Some(payload) = self.batcher.flush() {
+            self.queue(PendingItem::Data(payload))?;
         }
         self.pump()
     }
@@ -171,8 +188,8 @@ impl OutboundBody {
     ///
     /// Returns an error for a peer window greater than 64 or framing/sequence failure.
     pub fn set_peer_window(&mut self, receive_window: u32) -> Result<(), EngineError> {
-        let receive_window = usize::try_from(receive_window)
-            .map_err(|_| EngineError::InvalidWindow(usize::MAX))?;
+        let receive_window =
+            usize::try_from(receive_window).map_err(|_| EngineError::InvalidWindow(usize::MAX))?;
         if receive_window > 64 {
             return Err(EngineError::InvalidWindow(receive_window));
         }
@@ -213,11 +230,7 @@ impl OutboundBody {
 
     /// Return never-sent or expired retained frames and mark this dispatch attempt.
     #[must_use]
-    pub fn take_sendable(
-        &mut self,
-        now_ms: u64,
-        retry_policy: RetryPolicy,
-    ) -> Vec<RetainedFrame> {
+    pub fn take_sendable(&mut self, now_ms: u64, retry_policy: RetryPolicy) -> Vec<RetainedFrame> {
         let sequences = self
             .in_flight
             .iter()
@@ -302,9 +315,12 @@ impl OutboundBody {
             };
             let sequence = self.next_sequence;
             let encoded = match &item {
-                PendingItem::Data(payload) => {
-                    encode_data(self.transaction_id, self.direction, sequence, payload.clone())?
-                }
+                PendingItem::Data(payload) => encode_data(
+                    self.transaction_id,
+                    self.direction,
+                    sequence,
+                    payload.clone(),
+                )?,
                 PendingItem::End(end) => encode_end(self.transaction_id, sequence, end)?,
             };
             let projected = self

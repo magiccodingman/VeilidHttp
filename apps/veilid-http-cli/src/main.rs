@@ -1,10 +1,19 @@
+//! Operator CLI for inspecting, exporting, and validating VeilidHttp bridge state.
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "veilid-http-cli", version, about = "VeilidHttp route and server tooling")]
+#[command(
+    name = "veilid-http-cli",
+    version,
+    about = "VeilidHttp route and server tooling"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -66,7 +75,10 @@ enum TransferCommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum ExportFormat { Base64, Descriptor }
+enum ExportFormat {
+    Base64,
+    Descriptor,
+}
 
 #[derive(Debug, Serialize)]
 struct Descriptor<'a> {
@@ -165,7 +177,11 @@ fn list_transfer_entries(data_dir: &Path) -> Result<Vec<TransferEntry>> {
             entries.push(TransferEntry {
                 area: area.to_owned(),
                 name: item.file_name().to_string_lossy().into_owned(),
-                bytes: if metadata.is_file() { metadata.len() } else { 0 },
+                bytes: if metadata.is_file() {
+                    metadata.len()
+                } else {
+                    0
+                },
             });
         }
     }
@@ -173,95 +189,136 @@ fn list_transfer_entries(data_dir: &Path) -> Result<Vec<TransferEntry>> {
     Ok(entries)
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Route { command } => match command {
-            RouteCommand::Show { data_dir, json } => {
-                let report = route_report(&data_dir)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    println!("fingerprint={}", report.metadata.fingerprint);
-                    println!("fingerprint_verified={}", report.fingerprint_verified);
-                    println!("route_id={}", report.metadata.route_id);
-                    println!("veilid_version={}", report.metadata.veilid_version);
-                    println!("created_at_unix_seconds={}", report.metadata.created_at_unix_seconds);
-                    println!("blob_bytes={}", report.blob_bytes);
-                    println!("base64_bytes={}", report.base64_bytes);
-                }
-                if !report.fingerprint_verified {
-                    bail!("current RouteBlob does not match its persisted fingerprint");
-                }
-            }
-            RouteCommand::Export { file, format } => {
-                let bytes = read(&file)?;
-                let encoded = veilid_http_route::encode_route_blob(&bytes);
-                match format {
-                    ExportFormat::Base64 => println!("{encoded}"),
-                    ExportFormat::Descriptor => println!(
-                        "{}",
-                        serde_json::to_string_pretty(&Descriptor {
-                            schema: "org.veilidhttp.app/v1",
-                            name: "VeilidHttp Site",
-                            route_blob: encoded,
-                            start_path: "/",
-                        })?
-                    ),
-                }
-            }
-            RouteCommand::Fingerprint { file } => println!("{}", veilid_http_route::fingerprint(&read(&file)?)),
-        },
-        Command::Status { data_dir, json } => {
-            if !data_dir.exists() {
-                bail!("data directory does not exist: {}", data_dir.display());
-            }
-            let route = route_report(&data_dir).ok();
-            let report = StatusReport {
-                status: if route.as_ref().is_some_and(|value| value.fingerprint_verified) {
-                    "ready"
-                } else {
-                    "not-ready"
-                },
-                data_dir: data_dir.display().to_string(),
-                route_present: data_dir.join("route/current.blob").is_file(),
-                route_metadata_present: data_dir.join("route/current.json").is_file(),
-                route_fingerprint: route.as_ref().map(|value| value.metadata.fingerprint.clone()),
-                veilid_version: route.as_ref().map(|value| value.metadata.veilid_version.clone()),
-                active_transfer_entries: count_entries(&data_dir.join("transfers"))?,
-                completed_entries: count_entries(&data_dir.join("completed"))?,
-                spool_entries: count_entries(&data_dir.join("spool"))?,
-            };
+fn handle_route(command: RouteCommand) -> Result<()> {
+    match command {
+        RouteCommand::Show { data_dir, json } => {
+            let report = route_report(&data_dir)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("status={}", report.status);
-                println!("data_dir={}", report.data_dir);
-                println!("route_present={}", report.route_present);
-                println!("route_metadata_present={}", report.route_metadata_present);
-                println!("route_fingerprint={}", report.route_fingerprint.as_deref().unwrap_or(""));
-                println!("veilid_version={}", report.veilid_version.as_deref().unwrap_or(""));
-                println!("active_transfer_entries={}", report.active_transfer_entries);
-                println!("completed_entries={}", report.completed_entries);
-                println!("spool_entries={}", report.spool_entries);
+                println!("fingerprint={}", report.metadata.fingerprint);
+                println!("fingerprint_verified={}", report.fingerprint_verified);
+                println!("route_id={}", report.metadata.route_id);
+                println!("veilid_version={}", report.metadata.veilid_version);
+                println!(
+                    "created_at_unix_seconds={}",
+                    report.metadata.created_at_unix_seconds
+                );
+                println!("blob_bytes={}", report.blob_bytes);
+                println!("base64_bytes={}", report.base64_bytes);
             }
-            if report.status != "ready" {
-                bail!("VeilidHttp bridge has not published a verified current private route");
+            if !report.fingerprint_verified {
+                bail!("current RouteBlob does not match its persisted fingerprint");
             }
         }
-        Command::Transfers { command } => match command {
-            TransferCommand::List { data_dir, json } => {
-                let entries = list_transfer_entries(&data_dir)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&entries)?);
-                } else if entries.is_empty() {
-                    println!("no retained transfer entries");
-                } else {
-                    for entry in entries {
-                        println!("area={} name={} bytes={}", entry.area, entry.name, entry.bytes);
-                    }
-                }
+        RouteCommand::Export { file, format } => {
+            let bytes = read(&file)?;
+            let encoded = veilid_http_route::encode_route_blob(&bytes);
+            match format {
+                ExportFormat::Base64 => println!("{encoded}"),
+                ExportFormat::Descriptor => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&Descriptor {
+                        schema: "org.veilidhttp.app/v1",
+                        name: "VeilidHttp Site",
+                        route_blob: encoded,
+                        start_path: "/",
+                    })?
+                ),
             }
-        },
+        }
+        RouteCommand::Fingerprint { file } => {
+            println!("{}", veilid_http_route::fingerprint(&read(&file)?));
+        }
     }
     Ok(())
+}
+
+fn status_report(data_dir: &Path) -> Result<StatusReport> {
+    if !data_dir.exists() {
+        bail!("data directory does not exist: {}", data_dir.display());
+    }
+    let route = route_report(data_dir).ok();
+    Ok(StatusReport {
+        status: if route
+            .as_ref()
+            .is_some_and(|value| value.fingerprint_verified)
+        {
+            "ready"
+        } else {
+            "not-ready"
+        },
+        data_dir: data_dir.display().to_string(),
+        route_present: data_dir.join("route/current.blob").is_file(),
+        route_metadata_present: data_dir.join("route/current.json").is_file(),
+        route_fingerprint: route
+            .as_ref()
+            .map(|value| value.metadata.fingerprint.clone()),
+        veilid_version: route
+            .as_ref()
+            .map(|value| value.metadata.veilid_version.clone()),
+        active_transfer_entries: count_entries(&data_dir.join("transfers"))?,
+        completed_entries: count_entries(&data_dir.join("completed"))?,
+        spool_entries: count_entries(&data_dir.join("spool"))?,
+    })
+}
+
+fn handle_status(data_dir: PathBuf, json: bool) -> Result<()> {
+    let report = status_report(&data_dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("status={}", report.status);
+        println!("data_dir={}", report.data_dir);
+        println!("route_present={}", report.route_present);
+        println!("route_metadata_present={}", report.route_metadata_present);
+        println!(
+            "route_fingerprint={}",
+            report.route_fingerprint.as_deref().unwrap_or("")
+        );
+        println!(
+            "veilid_version={}",
+            report.veilid_version.as_deref().unwrap_or("")
+        );
+        println!("active_transfer_entries={}", report.active_transfer_entries);
+        println!("completed_entries={}", report.completed_entries);
+        println!("spool_entries={}", report.spool_entries);
+    }
+    if report.status != "ready" {
+        bail!("VeilidHttp bridge has not published a verified current private route");
+    }
+    Ok(())
+}
+
+fn handle_transfers(command: TransferCommand) -> Result<()> {
+    match command {
+        TransferCommand::List { data_dir, json } => {
+            let entries = list_transfer_entries(&data_dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("no retained transfer entries");
+            } else {
+                for entry in entries {
+                    println!(
+                        "area={} name={} bytes={}",
+                        entry.area, entry.name, entry.bytes
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Route { command } => handle_route(command),
+        Command::Status { data_dir, json } => handle_status(data_dir, json),
+        Command::Transfers { command } => handle_transfers(command),
+    }
+}
+
+fn main() -> Result<()> {
+    run(Cli::parse().command)
 }

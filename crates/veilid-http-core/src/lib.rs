@@ -44,7 +44,10 @@ impl ReceiveWindow {
                 selective |= 1_u64 << offset;
             }
         }
-        AckSnapshot { cumulative, selective }
+        AckSnapshot {
+            cumulative,
+            selective,
+        }
     }
 
     /// Determine whether a particular sequence is acknowledged.
@@ -52,8 +55,12 @@ impl ReceiveWindow {
         if snapshot.cumulative.is_some_and(|value| sequence <= value) {
             return true;
         }
-        let base = snapshot.cumulative.map_or(0, |value| value.saturating_add(1));
-        let Some(offset) = sequence.checked_sub(base) else { return false };
+        let base = snapshot
+            .cumulative
+            .map_or(0, |value| value.saturating_add(1));
+        let Some(offset) = sequence.checked_sub(base) else {
+            return false;
+        };
         offset < ACK_BITMAP_BITS && (snapshot.selective & (1_u64 << offset)) != 0
     }
 }
@@ -71,7 +78,10 @@ impl Reassembler {
     /// Create a reassembler with a hard out-of-order byte limit.
     #[must_use]
     pub fn new(max_pending_bytes: usize) -> Self {
-        Self { max_pending_bytes, ..Self::default() }
+        Self {
+            max_pending_bytes,
+            ..Self::default()
+        }
     }
 
     /// Insert a frame and return newly contiguous chunks in delivery order.
@@ -114,7 +124,10 @@ impl FrameBatcher {
             .min(DEFAULT_FRAME_LIMIT)
             .saturating_sub(HEADER_LEN + reserved_metadata)
             .max(1);
-        Self { target_payload, buffer: Vec::with_capacity(target_payload) }
+        Self {
+            target_payload,
+            buffer: Vec::with_capacity(target_payload),
+        }
     }
 
     /// Push bytes and return every complete payload frame produced.
@@ -177,7 +190,12 @@ impl SendWindow {
         if capacity == 0 {
             return Err(CoreError::InvalidWindowCapacity);
         }
-        Ok(Self { capacity, next_sequence: 0, in_flight: BTreeMap::new(), in_flight_bytes: 0 })
+        Ok(Self {
+            capacity,
+            next_sequence: 0,
+            in_flight: BTreeMap::new(),
+            in_flight_bytes: 0,
+        })
     }
 
     /// Whether another frame can enter the send window.
@@ -189,21 +207,33 @@ impl SendWindow {
     /// Allocate a sequence and retain a frame until it is acknowledged.
     pub fn enqueue(&mut self, bytes: Bytes) -> Result<u32, CoreError> {
         if !self.has_capacity() {
-            return Err(CoreError::SendWindowFull { capacity: self.capacity });
+            return Err(CoreError::SendWindowFull {
+                capacity: self.capacity,
+            });
         }
         let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.checked_add(1).ok_or(CoreError::SequenceExhausted)?;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(CoreError::SequenceExhausted)?;
         self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes.len());
         self.in_flight.insert(
             sequence,
-            InFlightFrame { sequence, bytes, last_sent_ms: None, attempts: 0 },
+            InFlightFrame {
+                sequence,
+                bytes,
+                last_sent_ms: None,
+                attempts: 0,
+            },
         );
         Ok(sequence)
     }
 
     /// Mark a retained frame as dispatched at `now_ms`.
     pub fn mark_sent(&mut self, sequence: u32, now_ms: u64) -> bool {
-        let Some(frame) = self.in_flight.get_mut(&sequence) else { return false };
+        let Some(frame) = self.in_flight.get_mut(&sequence) else {
+            return false;
+        };
         frame.last_sent_ms = Some(now_ms);
         frame.attempts = frame.attempts.saturating_add(1);
         true
@@ -271,7 +301,9 @@ impl RetryPolicy {
     #[must_use]
     pub fn delay_ms(self, attempts: u32) -> u64 {
         let shift = attempts.min(20);
-        self.initial_ms.saturating_mul(1_u64 << shift).min(self.maximum_ms)
+        self.initial_ms
+            .saturating_mul(1_u64 << shift)
+            .min(self.maximum_ms)
     }
 }
 
@@ -311,13 +343,21 @@ impl TransactionJournal {
     /// Insert a new transaction; returns false if it already exists.
     pub fn begin(&mut self, id: [u8; 16], now_ms: u64) -> bool {
         self.entries
-            .insert(id, JournalEntry { state: TransactionState::Receiving, last_activity_ms: now_ms })
+            .insert(
+                id,
+                JournalEntry {
+                    state: TransactionState::Receiving,
+                    last_activity_ms: now_ms,
+                },
+            )
             .is_none()
     }
 
     /// Update state and activity timestamp.
     pub fn transition(&mut self, id: &[u8; 16], state: TransactionState, now_ms: u64) -> bool {
-        let Some(entry) = self.entries.get_mut(id) else { return false };
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
         entry.state = state;
         entry.last_activity_ms = now_ms;
         true
@@ -333,8 +373,10 @@ impl TransactionJournal {
     pub fn expire_idle(&mut self, now_ms: u64, idle_ms: u64) -> Vec<[u8; 16]> {
         let mut expired = Vec::new();
         for (id, entry) in &mut self.entries {
-            if !matches!(entry.state, TransactionState::Completed | TransactionState::Cancelled)
-                && now_ms.saturating_sub(entry.last_activity_ms) >= idle_ms
+            if !matches!(
+                entry.state,
+                TransactionState::Completed | TransactionState::Cancelled
+            ) && now_ms.saturating_sub(entry.last_activity_ms) >= idle_ms
             {
                 entry.state = TransactionState::Expired;
                 expired.push(*id);
@@ -355,9 +397,14 @@ pub fn decompress_bounded(bytes: &[u8], max_output: usize) -> Result<Vec<u8>, Co
     let decoder = zstd::stream::read::Decoder::new(bytes).map_err(CoreError::Compression)?;
     let mut limited = decoder.take(max_output.saturating_add(1) as u64);
     let mut output = Vec::new();
-    limited.read_to_end(&mut output).map_err(CoreError::Compression)?;
+    limited
+        .read_to_end(&mut output)
+        .map_err(CoreError::Compression)?;
     if output.len() > max_output {
-        return Err(CoreError::DecompressedLimit { actual: output.len(), limit: max_output });
+        return Err(CoreError::DecompressedLimit {
+            actual: output.len(),
+            limit: max_output,
+        });
     }
     Ok(output)
 }
@@ -376,19 +423,32 @@ pub enum CoreError {
     InvalidWindowCapacity,
     /// No more frames fit in the current send window.
     #[error("send window is full at {capacity} frames")]
-    SendWindowFull { capacity: usize },
+    SendWindowFull {
+        /// Maximum number of frames the window can retain.
+        capacity: usize,
+    },
     /// Per-direction sequence number space was exhausted.
     #[error("sequence number space exhausted")]
     SequenceExhausted,
     /// Out-of-order buffering exceeded its configured bound.
     #[error("pending reassembly bytes {actual} exceed limit {limit}")]
-    PendingLimit { actual: usize, limit: usize },
+    PendingLimit {
+        /// Pending bytes observed after the rejected insertion.
+        actual: usize,
+        /// Configured maximum pending bytes.
+        limit: usize,
+    },
     /// Zstandard operation failed.
     #[error("zstandard operation failed: {0}")]
     Compression(std::io::Error),
     /// Decoded data exceeded its configured logical bound.
     #[error("decompressed bytes {actual} exceed limit {limit}")]
-    DecompressedLimit { actual: usize, limit: usize },
+    DecompressedLimit {
+        /// Decoded bytes observed or declared.
+        actual: usize,
+        /// Configured maximum decoded bytes.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -411,17 +471,34 @@ mod tests {
     #[test]
     fn reassembler_delivers_in_order_and_deduplicates() {
         let mut reassembler = Reassembler::new(1024);
-        assert!(reassembler.push(1, Bytes::from_static(b"b")).unwrap().is_empty());
+        assert!(
+            reassembler
+                .push(1, Bytes::from_static(b"b"))
+                .unwrap()
+                .is_empty()
+        );
         let ready = reassembler.push(0, Bytes::from_static(b"a")).unwrap();
-        assert_eq!(ready, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
-        assert!(reassembler.push(1, Bytes::from_static(b"b")).unwrap().is_empty());
+        assert_eq!(
+            ready,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
+        assert!(
+            reassembler
+                .push(1, Bytes::from_static(b"b"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn batcher_keeps_memory_bounded_to_frame_target() {
         let mut batcher = FrameBatcher::new(1024, 128);
         let frames = batcher.push(&vec![7; 5000]);
-        assert!(frames.iter().all(|frame| frame.len() == batcher.target_payload()));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.len() == batcher.target_payload())
+        );
         assert!(batcher.flush().is_some());
     }
 
@@ -438,7 +515,10 @@ mod tests {
             assert_eq!(window.len(), 4);
             assert_eq!(window.retained_bytes(), 4096);
             let first = *window.in_flight.keys().next().unwrap();
-            window.acknowledge(AckSnapshot { cumulative: Some(first), selective: 0 });
+            window.acknowledge(AckSnapshot {
+                cumulative: Some(first),
+                selective: 0,
+            });
         }
         assert!(produced > 10_000);
     }
@@ -449,14 +529,20 @@ mod tests {
         for _ in 0..4 {
             window.enqueue(Bytes::from_static(b"frame")).unwrap();
         }
-        let removed = window.acknowledge(AckSnapshot { cumulative: Some(0), selective: 0b10 });
+        let removed = window.acknowledge(AckSnapshot {
+            cumulative: Some(0),
+            selective: 0b10,
+        });
         assert_eq!(removed, vec![0, 2]);
         assert_eq!(window.len(), 2);
     }
 
     #[test]
     fn retry_policy_caps_exponential_backoff() {
-        let policy = RetryPolicy { initial_ms: 500, maximum_ms: 30_000 };
+        let policy = RetryPolicy {
+            initial_ms: 500,
+            maximum_ms: 30_000,
+        };
         assert_eq!(policy.delay_ms(0), 500);
         assert_eq!(policy.delay_ms(3), 4000);
         assert_eq!(policy.delay_ms(30), 30_000);
@@ -466,7 +552,10 @@ mod tests {
     fn zstd_round_trip_and_limit() {
         let original = vec![42_u8; 256 * 1024];
         let compressed = compress(&original, 3).unwrap();
-        assert_eq!(decompress_bounded(&compressed, original.len()).unwrap(), original);
+        assert_eq!(
+            decompress_bounded(&compressed, original.len()).unwrap(),
+            original
+        );
         assert!(matches!(
             decompress_bounded(&compressed, 1024),
             Err(CoreError::DecompressedLimit { .. })
@@ -480,6 +569,9 @@ mod tests {
         assert!(journal.begin(id, 10));
         assert!(!journal.begin(id, 11));
         assert!(journal.transition(&id, TransactionState::Forwarding, 12));
-        assert_eq!(journal.get(&id).unwrap().state, TransactionState::Forwarding);
+        assert_eq!(
+            journal.get(&id).unwrap().state,
+            TransactionState::Forwarding
+        );
     }
 }

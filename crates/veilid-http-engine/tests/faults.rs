@@ -1,6 +1,8 @@
+//! Fault-injection coverage for VHTTP body ordering, retry, deduplication, and windows.
+
 use bytes::Bytes;
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_stream::{CompressionMode, DecodedFrame, StreamDirection, decode};
 
 #[test]
@@ -9,19 +11,27 @@ fn end_waits_for_missing_data_and_duplicates_deliver_once() {
     let mut sender = OutboundBody::new(
         transaction,
         StreamDirection::Response,
-        CompressionMode::None,
-        0,
-        1024,
-        128,
-        8,
-        64 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::None,
+            zstd_level: 0,
+            frame_limit: 1024,
+            reserved_metadata: 128,
+            window_frames: 8,
+            max_pending_bytes: 64 * 1024,
+        },
     )
     .unwrap();
     sender.push(b"alpha", true).unwrap();
     sender.push(b"beta", true).unwrap();
     sender.finish_input().unwrap();
     let mut frames = sender
-        .take_sendable(0, RetryPolicy { initial_ms: 10, maximum_ms: 100 })
+        .take_sendable(
+            0,
+            RetryPolicy {
+                initial_ms: 10,
+                maximum_ms: 100,
+            },
+        )
         .into_iter()
         .map(|frame| frame.encoded)
         .collect::<Vec<_>>();
@@ -41,10 +51,16 @@ fn end_waits_for_missing_data_and_duplicates_deliver_once() {
     .unwrap();
     assert!(!receiver.receive(end).unwrap().completed);
     let first_output = receiver.receive(first.clone()).unwrap();
-    assert_eq!(first_output.logical_chunks, vec![Bytes::from_static(b"alpha")]);
+    assert_eq!(
+        first_output.logical_chunks,
+        vec![Bytes::from_static(b"alpha")]
+    );
     assert!(receiver.receive(first).unwrap().logical_chunks.is_empty());
     let second_output = receiver.receive(second).unwrap();
-    assert_eq!(second_output.logical_chunks, vec![Bytes::from_static(b"beta")]);
+    assert_eq!(
+        second_output.logical_chunks,
+        vec![Bytes::from_static(b"beta")]
+    );
     assert!(second_output.completed);
 }
 
@@ -57,12 +73,14 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
     let mut sender = OutboundBody::new(
         transaction,
         StreamDirection::Request,
-        CompressionMode::Zstd,
-        3,
-        2048,
-        256,
-        8,
-        1024 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::Zstd,
+            zstd_level: 3,
+            frame_limit: 2048,
+            reserved_metadata: 256,
+            window_frames: 8,
+            max_pending_bytes: 1024 * 1024,
+        },
     )
     .unwrap();
     let input_chunk = sender.max_input_chunk();
@@ -79,7 +97,10 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         u64::try_from(input.len()).unwrap(),
     )
     .unwrap();
-    let policy = RetryPolicy { initial_ms: 10, maximum_ms: 100 };
+    let policy = RetryPolicy {
+        initial_ms: 10,
+        maximum_ms: 100,
+    };
     let mut now = 0;
     let mut dropped_one = false;
     let mut output = Vec::new();
@@ -88,19 +109,20 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         let mut sent = sender.take_sendable(now, policy);
         sent.reverse();
         for retained in sent {
-            let sequence = match decode(retained.encoded.clone()).unwrap() {
-                DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. } => sequence,
-                _ => unreachable!(),
+            let (DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. }) =
+                decode(retained.encoded.clone()).unwrap()
+            else {
+                unreachable!();
             };
             if sequence == 1 && !dropped_one {
                 dropped_one = true;
                 continue;
             }
-            let received = receiver.receive(retained.encoded).unwrap();
-            for chunk in received.logical_chunks {
+            let stream_output = receiver.receive(retained.encoded).unwrap();
+            for chunk in stream_output.logical_chunks {
                 output.extend_from_slice(&chunk);
             }
-            sender.acknowledge(received.ack).unwrap();
+            sender.acknowledge(stream_output.ack).unwrap();
         }
         assert!(sender.in_flight_frames() <= 8);
         if sender.is_complete() && receiver.is_complete() {
@@ -120,12 +142,14 @@ fn peer_zero_window_stops_new_frames_and_reopens_cleanly() {
     let mut sender = OutboundBody::new(
         [1; 16],
         StreamDirection::Response,
-        CompressionMode::None,
-        0,
-        1024,
-        128,
-        4,
-        16 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::None,
+            zstd_level: 0,
+            frame_limit: 1024,
+            reserved_metadata: 128,
+            window_frames: 4,
+            max_pending_bytes: 16 * 1024,
+        },
     )
     .unwrap();
     sender.set_peer_window(0).unwrap();

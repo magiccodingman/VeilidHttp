@@ -17,10 +17,20 @@ pub enum EngineError {
     InvalidPendingBound(usize),
     /// One logical input chunk exceeded the bounded-ingress hint.
     #[error("logical input chunk {actual} exceeds limit {limit}")]
-    InputChunkTooLarge { actual: usize, limit: usize },
+    InputChunkTooLarge {
+        /// Logical input bytes supplied by the caller.
+        actual: usize,
+        /// Maximum logical bytes accepted by one push.
+        limit: usize,
+    },
     /// Pending compressed bytes exceeded the configured hard bound.
     #[error("pending encoded bytes {actual} exceed limit {limit}")]
-    PendingLimit { actual: usize, limit: usize },
+    PendingLimit {
+        /// Pending and retained bytes after the rejected operation.
+        actual: usize,
+        /// Configured maximum buffered bytes.
+        limit: usize,
+    },
     /// Sequence space was exhausted.
     #[error("VHTTP stream sequence space exhausted")]
     SequenceExhausted,

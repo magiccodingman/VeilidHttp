@@ -1,3 +1,5 @@
+//! End-to-end streamed bridge round-trip and duplicate-suppression tests.
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
@@ -24,9 +26,7 @@ use veilid_http_stream::{
     CompressionMode, DecodedFrame, RequestOpen, StreamDirection, decode, encode_ack,
     encode_request_open,
 };
-use veilid_http_transport::{
-    RouteTarget, TransportError, TransportEvent, VeilidTransport,
-};
+use veilid_http_transport::{RouteTarget, TransportError, TransportEvent, VeilidTransport};
 use veilid_http_wire::{Frame, FrameBundle};
 
 #[derive(Debug)]
@@ -75,11 +75,7 @@ impl VeilidTransport for MockTransport {
             .map_err(|_| TransportError::Shutdown)
     }
 
-    async fn app_call_reply(
-        &self,
-        call_id: &str,
-        payload: Bytes,
-    ) -> Result<(), TransportError> {
+    async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError> {
         self.replies
             .send((call_id.to_owned(), payload))
             .map_err(|_| TransportError::Shutdown)
@@ -91,12 +87,13 @@ impl VeilidTransport for MockTransport {
 }
 
 fn split_frames(payload: Bytes) -> Vec<Bytes> {
-    FrameBundle::decode(payload.clone())
-        .map(|bundle| bundle.frames)
-        .unwrap_or_else(|_| {
+    FrameBundle::decode(payload.clone()).map_or_else(
+        |_| {
             Frame::decode(payload.clone()).expect("single VHTTP frame");
             vec![payload]
-        })
+        },
+        |bundle| bundle.frames,
+    )
 }
 
 async fn start_http_fixture() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -135,6 +132,7 @@ async fn start_http_fixture() -> (String, Arc<AtomicUsize>, tokio::task::JoinHan
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn streamed_get_forwards_once_and_rejects_completed_duplicate() {
     let (upstream, hits, server_task) = start_http_fixture().await;
     let root = std::env::temp_dir().join(format!(

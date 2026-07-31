@@ -27,10 +27,10 @@ one configured upstream application or reverse proxy
 Electron main process
 ├── trusted navigation shell
 ├── sandboxed site WebContentsView
-├── privileged veilid:// protocol handler
+├── validated 127.0.0.1 *.veilid.localhost origin server
 └── authenticated private binary IPC
     └── native Rust sidecar
-        ├── embedded veilid-core 0.5.7
+        ├── embedded veilid-core 0.5.5
         ├── rotating private return route
         ├── VHTTP client engine
         └── bounded streaming channels
@@ -94,6 +94,7 @@ prefixed Veilid AppMessage bundle while preserving independent transaction state
 
 ```text
 Chromium ReadableStream
+↕ Electron-main loopback HTTP stream
 ↕ bounded socket/pipe IPC
 ↕ bounded native channels
 ↕ independent streaming zstd context
@@ -121,25 +122,41 @@ not unfinished body bytes.
 
 Every transaction uses a 128-bit ID. The bridge coordinates atomic and streamed paths:
 
+- A durable pre-execution claim is written before forwarding a new transaction.
 - Concurrent duplicates do not create another upstream request.
+- Capacity exhaustion is retryable and does not poison a new transaction ID.
 - Small atomic responses may be retained and replayed.
 - Large or streamed completions leave durable tombstones.
-- Recent completed IDs are not forwarded again after a lost reply or restart.
+- A recovered in-flight claim becomes an indeterminate tombstone after restart.
+- Recent completed or indeterminate IDs are not forwarded again after a lost reply or
+  restart.
 
 This is an honest at-most-once boundary within retained bridge state, not a claim of
-perfect distributed exactly-once side effects.
+perfect distributed exactly-once side effects. When crash recovery cannot determine
+whether the upstream executed a request, it deliberately refuses automatic replay.
 
 ## Browser origin
 
-The preferred origin is `veilid://<route-fingerprint>/`. Electron registers the scheme
-as standard, secure, Fetch-capable, CORS-enabled, stream-capable, code-cache-capable,
-and service-worker-capable. Each site uses an isolated persistent partition.
+Each RouteBlob fingerprint is exposed to Chromium at:
+
+```text
+http://<fingerprint>.veilid.localhost:<stable-port>/
+```
+
+Electron main owns a listener bound only to `127.0.0.1`. It validates the Host header,
+extracts exactly one 26-character Base32 fingerprint, and streams the request through
+authenticated sidecar IPC. Each site also uses an isolated persistent Electron
+partition.
+
+This origin model is required because Chromium Cache Storage rejects requests whose URL
+uses a custom `veilid:` scheme, even when that scheme is registered as standard, secure,
+Fetch-capable, CORS-enabled, stream-capable, code-cache-capable, and service-worker-
+capable. Loopback localhost origins retain trustworthy-context browser behavior without
+fake certificates or disabled web security.
 
 A real Electron smoke harness validates service workers, Cache Storage, IndexedDB,
-CORS, WebAssembly, secure-context behavior, persistent sessions, and a streamed custom-
-protocol response. If Chromium rejects an important framework behavior, the fallback is
-`http://<fingerprint>.veilid.localhost:<stable-port>/`; disabling web security or
-emulating certificates is not acceptable.
+CORS, WebAssembly, secure-context behavior, persistent sessions, and streamed responses
+on the implemented localhost-origin model.
 
 ## Route identity and lifecycle
 
@@ -162,7 +179,8 @@ operations, not arbitrary filesystem access.
 
 Electron main and the sidecar communicate through a random mode-0600 Unix socket or
 Windows named pipe authenticated by a one-launch secret. IPC metadata/payload sizes are
-bounded. Public HTTPS remains ordinary Chromium networking. Cross-origin Veilid requests
+bounded. The loopback HTTP server accepts only validated site hosts on `127.0.0.1`.
+Public HTTPS remains ordinary Chromium networking. Cross-origin Veilid site requests
 remain subject to Chromium CORS.
 
 ## Forwarded route metadata
@@ -174,8 +192,10 @@ X-Veilid-Route-Fingerprint: <128-bit-base32-fingerprint>
 X-Veilid-Origin: veilid://<fingerprint>
 ```
 
-A reverse proxy may log or route using these values. They describe the receiving
-VeilidHttp route; they are not user authentication credentials.
+`X-Veilid-Origin` is a canonical overlay identity for backend metadata; it is not the
+literal Chromium address bar URL. A reverse proxy may log or route using these values.
+They describe the receiving VeilidHttp route and are not user authentication
+credentials.
 
 ## Hostile-network defaults
 

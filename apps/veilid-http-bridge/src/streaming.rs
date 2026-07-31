@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::{StreamExt as _, stream};
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,15 +15,14 @@ use tokio::{
     task::JoinHandle,
 };
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_http::{
     HeaderField, ResponseHead, attach_route_headers, normalize_request, strip_hop_by_hop,
     upstream_url,
 };
 use veilid_http_stream::{
-    CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen,
-    StreamDirection, StreamError, decode, encode_ack, encode_error, encode_request_accepted,
-    encode_response_open,
+    CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen, StreamDirection,
+    StreamError, decode, encode_ack, encode_error, encode_request_accepted, encode_response_open,
 };
 use veilid_http_transport::{RouteTarget, VeilidTransport};
 use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
@@ -56,14 +56,6 @@ impl StreamingConfig {
             u64::MAX
         } else {
             self.max_request_bytes
-        }
-    }
-
-    fn response_limit(&self) -> u64 {
-        if self.max_response_bytes == 0 {
-            u64::MAX
-        } else {
-            self.max_response_bytes
         }
     }
 }
@@ -154,7 +146,9 @@ impl StreamingBridge {
                 initial_payload,
             } => {
                 if !initial_payload.is_empty() {
-                    bail!("stream RequestOpen initial payload is reserved until sequenced initial-data support is enabled");
+                    bail!(
+                        "stream RequestOpen initial payload is reserved until sequenced initial-data support is enabled"
+                    );
                 }
                 (transaction_id, value)
             }
@@ -171,7 +165,24 @@ impl StreamingBridge {
 
         match self.completion.claim(transaction_id).await {
             CompletionClaim::Execute => {}
-            CompletionClaim::Wait(_) | CompletionClaim::Replay(_) | CompletionClaim::Tombstone => {
+            CompletionClaim::WaitCapacity(_) => {
+                let reply = encode_error(
+                    transaction_id,
+                    &StreamError {
+                        code: "server-busy".to_owned(),
+                        message: "the bridge has reached its active transaction limit".to_owned(),
+                        retryable: true,
+                    },
+                )?;
+                self.transport
+                    .app_call_reply(call_id, reply)
+                    .await
+                    .context("reply to capacity-limited RequestOpen")?;
+                return Ok(());
+            }
+            CompletionClaim::WaitDuplicate(_)
+            | CompletionClaim::Replay(_)
+            | CompletionClaim::Tombstone => {
                 let reply = encode_error(
                     transaction_id,
                     &StreamError {
@@ -292,11 +303,7 @@ impl StreamingBridge {
         });
         *transaction.task.lock().await = Some(task);
 
-        if let Err(error) = self
-            .transport
-            .app_call_reply(call_id, accepted_reply)
-            .await
-        {
+        if let Err(error) = self.transport.app_call_reply(call_id, accepted_reply).await {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
             }
@@ -340,7 +347,9 @@ impl StreamingBridge {
                         .lock()
                         .await
                         .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("transaction does not accept a request body"))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("transaction does not accept a request body")
+                        })?
                         .receive(encoded)?;
                     for chunk in output.logical_chunks {
                         let sender = transaction.upstream_body.lock().await.clone();
@@ -355,9 +364,8 @@ impl StreamingBridge {
                     if output.completed {
                         transaction.upstream_body.lock().await.take();
                     }
-                    let should_ack = output.completed
-                        || output.ack.selective != 0
-                        || sequence % 4 == 3;
+                    let should_ack =
+                        output.completed || output.ack.selective != 0 || sequence % 4 == 3;
                     if should_ack {
                         pending_acks
                             .entry(transaction.return_target.clone())
@@ -413,12 +421,7 @@ impl StreamingBridge {
 
     /// Abort every active transaction, used when the server receiving route dies.
     pub async fn cancel_all(&self) {
-        let transactions = self
-            .transactions
-            .lock()
-            .await
-            .drain()
-            .collect::<Vec<_>>();
+        let transactions = self.transactions.lock().await.drain().collect::<Vec<_>>();
         for (id, transaction) in transactions {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
@@ -448,18 +451,22 @@ impl StreamingBridge {
             if let Err(error) = self.completion.record(id, None).await {
                 tracing::error!(%error, transaction = %hex_transaction(id), "failed to persist cancelled transaction tombstone");
             }
-        } else if matches!(
-            self.completion.lookup(id).await,
-            Some(
-                CompletionLookup::Response(_)
-                    | CompletionLookup::Tombstone
-                    | CompletionLookup::InFlight
-            )
-        ) {
-            tracing::debug!(transaction = %hex_transaction(id), "ignored cancellation for completed transaction");
+        } else {
+            match self.completion.lookup(id).await {
+                Some(CompletionLookup::Response(response)) => tracing::debug!(
+                    transaction = %hex_transaction(id),
+                    retained_response_bytes = response.len(),
+                    "ignored cancellation for completed transaction with retained response"
+                ),
+                Some(CompletionLookup::Tombstone | CompletionLookup::InFlight) => {
+                    tracing::debug!(transaction = %hex_transaction(id), "ignored cancellation for completed transaction");
+                }
+                None => {}
+            }
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_upstream(
         &self,
         transaction_id: [u8; 16],
@@ -469,7 +476,8 @@ impl StreamingBridge {
         transaction: Arc<ServerTransaction>,
     ) -> Result<()> {
         let target = upstream_url(&self.config.upstream_url, &open.head.path_and_query)?;
-        let method = reqwest::Method::from_bytes(open.head.method.as_bytes())
+        let request_method = open.head.method.clone();
+        let method = reqwest::Method::from_bytes(request_method.as_bytes())
             .context("parse streamed HTTP method")?;
         let headers = attach_route_headers(
             open.head.headers,
@@ -514,13 +522,16 @@ impl StreamingBridge {
                 })
                 .collect::<Vec<_>>(),
         );
+        let response_has_body = !request_method.eq_ignore_ascii_case("HEAD")
+            && !(100..200).contains(&status)
+            && !matches!(status, 204 | 205 | 304);
         let response_open = ResponseOpen {
             head: ResponseHead {
                 status,
                 headers: response_headers,
             },
             response_compression: CompressionMode::Zstd,
-            response_body: true,
+            response_body: response_has_body,
             request_receive_window: self.config.window_frames,
         };
         self.transport
@@ -530,16 +541,21 @@ impl StreamingBridge {
             )
             .await
             .context("send streamed ResponseOpen")?;
+        if !response_has_body {
+            return Ok(());
+        }
 
         let mut outbound = OutboundBody::new(
             transaction_id,
             StreamDirection::Response,
-            CompressionMode::Zstd,
-            3,
-            self.config.frame_bytes,
-            256,
-            usize::try_from(self.config.window_frames).unwrap_or(32),
-            self.config.max_pending_bytes,
+            OutboundBodyConfig {
+                compression: CompressionMode::Zstd,
+                zstd_level: 3,
+                frame_limit: self.config.frame_bytes,
+                reserved_metadata: 256,
+                window_frames: usize::try_from(self.config.window_frames).unwrap_or(32),
+                max_pending_bytes: self.config.max_pending_bytes,
+            },
         )?;
         outbound.set_peer_window(open.response_receive_window)?;
         *transaction.response_sender.lock().await = Some(outbound);
@@ -547,6 +563,7 @@ impl StreamingBridge {
         let deadline = tokio::time::sleep(self.config.overall_timeout);
         tokio::pin!(deadline);
         let mut response_stream = response.bytes_stream();
+        let mut response_bytes = 0_u64;
         loop {
             self.dispatch_ready(&transaction).await?;
             let backpressured = transaction
@@ -567,7 +584,17 @@ impl StreamingBridge {
             tokio::select! {
                 item = response_stream.next() => {
                     match item {
-                        Some(Ok(chunk)) => self.push_response_chunk(&transaction, &chunk).await?,
+                        Some(Ok(chunk)) => {
+                            response_bytes = response_bytes
+                                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                                .ok_or_else(|| anyhow::anyhow!("response length overflow"))?;
+                            if self.config.max_response_bytes != 0
+                                && response_bytes > self.config.max_response_bytes
+                            {
+                                bail!("response body exceeds configured bridge limit");
+                            }
+                            self.push_response_chunk(&transaction, &chunk).await?;
+                        }
                         Some(Err(error)) => return Err(error).context("read streamed upstream response"),
                         None => break,
                     }
@@ -610,16 +637,50 @@ impl StreamingBridge {
         transaction: &ServerTransaction,
         chunk: &[u8],
     ) -> Result<()> {
-        let mut sender = transaction.response_sender.lock().await;
-        let outbound = sender
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("response sender is not initialized"))?;
-        let limit = outbound.max_input_chunk();
+        let limit = transaction
+            .response_sender
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("response sender is not initialized"))?
+            .max_input_chunk();
         let count = chunk.chunks(limit).count();
         for (index, part) in chunk.chunks(limit).enumerate() {
-            outbound.push(part, index + 1 == count)?;
+            tokio::time::timeout(
+                self.config.overall_timeout,
+                self.wait_for_response_capacity(transaction),
+            )
+            .await
+            .context("response sender remained backpressured past the overall timeout")??;
+            transaction
+                .response_sender
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("response sender disappeared"))?
+                .push(part, index + 1 == count)?;
+            self.dispatch_ready(transaction).await?;
         }
         Ok(())
+    }
+
+    async fn wait_for_response_capacity(&self, transaction: &ServerTransaction) -> Result<()> {
+        loop {
+            self.dispatch_ready(transaction).await?;
+            let backpressured = transaction
+                .response_sender
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(OutboundBody::is_backpressured);
+            if !backpressured {
+                return Ok(());
+            }
+            tokio::select! {
+                () = transaction.response_notify.notified() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
     }
 
     async fn dispatch_ready(&self, transaction: &ServerTransaction) -> Result<()> {
@@ -647,24 +708,17 @@ impl StreamingBridge {
             .context("send or retry response stream frames")
     }
 
-    async fn send_encoded_frames(
-        &self,
-        target: &RouteTarget,
-        frames: Vec<Bytes>,
-    ) -> Result<()> {
+    async fn send_encoded_frames(&self, target: &RouteTarget, frames: Vec<Bytes>) -> Result<()> {
         let mut bundle = Vec::new();
         let mut encoded_bytes = 8_usize;
         for frame in frames {
-            let projected = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            let projected = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             if !bundle.is_empty() && projected > VEILID_MESSAGE_LIMIT {
-                self.send_bundle(target, std::mem::take(&mut bundle)).await?;
+                self.send_bundle(target, std::mem::take(&mut bundle))
+                    .await?;
                 encoded_bytes = 8;
             }
-            encoded_bytes = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            encoded_bytes = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             bundle.push(frame);
         }
         if !bundle.is_empty() {
@@ -719,5 +773,9 @@ fn split_frames(payload: Bytes) -> Result<Vec<Bytes>> {
 }
 
 fn hex_transaction(id: [u8; 16]) -> String {
-    id.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut encoded = String::with_capacity(32);
+    for byte in id {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }

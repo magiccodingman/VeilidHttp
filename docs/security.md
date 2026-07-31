@@ -43,18 +43,27 @@ forged by a custom client. Servers use real application authentication where nee
 
 ## Request identity and retries
 
-A transaction ID correlates VHTTP frames and protects the upstream from ordinary retry
+A transaction ID correlates VHTTP frames and protects the upstream from retry
 duplication:
 
-- Concurrent duplicates share/wait on one active execution.
+- A new transaction ID is durably claimed before the bridge forwards it upstream.
+- Concurrent duplicates share or wait on one active execution.
 - Small atomic replies may be replayed.
 - Large and streamed completions leave durable tombstones.
 - Completed retained IDs are not forwarded upstream again.
+- An unfinished durable claim found after restart becomes an indeterminate tombstone.
 
-This is at-most-once forwarding within retained persistent state—not a claim that an
-arbitrary distributed system can provide perfect exactly-once execution. Destroying the
-bridge state, choosing a new transaction ID, or bypassing the conforming runtime changes
-that guarantee.
+That last rule is intentionally conservative. A crash may happen after the upstream
+executes but before VeilidHttp records the response. The bridge therefore treats a
+recovered in-flight claim as “possibly executed” and refuses to forward that same ID
+automatically. This can produce zero executions when a crash happened before the
+upstream received the request, but it prevents two executions under the same retained
+transaction ID.
+
+This is crash-safe at-most-once forwarding within retained persistent state—not a claim
+that an arbitrary distributed system can provide perfect exactly-once execution.
+Destroying bridge state, choosing a new transaction ID, or bypassing the conforming
+runtime changes that guarantee.
 
 ## Resource limits
 

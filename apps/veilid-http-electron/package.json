@@ -13,10 +13,12 @@
     "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
+    "@electron/fuses": "^1.8.0",
     "@electron-forge/cli": "^7.8.1",
     "@electron-forge/maker-deb": "^7.8.1",
     "@electron-forge/maker-squirrel": "^7.8.1",
     "@electron-forge/maker-zip": "^7.8.1",
+    "@electron-forge/plugin-fuses": "^7.8.1",
     "@electron-forge/plugin-webpack": "^7.8.1",
     "@electron-forge/shared-types": "^7.8.1",
     "@typescript-eslint/eslint-plugin": "^8.38.0",

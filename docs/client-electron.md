@@ -13,6 +13,8 @@ session management.
 - **Untrusted site view:** arbitrary remote HTML/JS/WASM with normal browser powers.
 - **Native sidecar:** embedded Veilid node and VHTTP engine, reachable only by Electron
   main through an authenticated private socket/pipe.
+- **Loopback origin server:** Electron-main-owned HTTP listener bound only to
+  `127.0.0.1`, translating site requests into streamed sidecar IPC.
 
 The untrusted site never receives Node.js, raw Electron IPC, a sidecar handle,
 filesystem APIs, process execution, environment variables, or access to the trusted
@@ -28,25 +30,37 @@ webSecurity: true
 allowRunningInsecureContent: false
 ```
 
-## Virtual origin
+## Browser origin
 
-`veilid://<fingerprint>/path` is registered before Electron is ready as standard,
-secure, CORS-enabled, Fetch-capable, stream-capable, code-cache-capable, and
-service-worker-capable.
-
-Every same-origin network request reaches the VHTTP handler after the site's own service
-worker and normal Chromium cache behavior:
+Each imported RouteBlob is exposed to Chromium as a stable loopback origin:
 
 ```text
-site -> service worker/cache -> veilid:// handler -> binary IPC -> VHTTP -> Veilid
+http://<fingerprint>.veilid.localhost:<stable-port>/
 ```
+
+The listener binds only to `127.0.0.1` and rejects Host headers that do not exactly match
+a valid 26-character site fingerprint plus the configured port. Different fingerprints
+therefore remain different browser origins while all overlay traffic still passes
+through the trusted main process and native sidecar.
+
+Every same-origin request reaches the VHTTP handler after the site's own service worker
+and normal Chromium cache behavior:
+
+```text
+site -> service worker/cache -> loopback origin -> binary IPC -> VHTTP -> Veilid
+```
+
+A direct `veilid://` custom scheme was prototyped, but Chromium Cache Storage rejects
+custom-scheme requests even when the scheme is registered as standard, secure, Fetch-
+capable, and service-worker-capable. The loopback-origin model is therefore the actual
+V1 implementation, not a degraded test path. Localhost is treated as a trustworthy
+browser context, so service workers, Cache Storage, IndexedDB, WebAssembly, streams,
+and ordinary CORS remain available without fake certificates or disabled web security.
 
 The CI browser harness launches real Electron and verifies service-worker interception,
 Cache Storage, IndexedDB, persistent sessions, cross-origin CORS, WebAssembly,
-secure-context behavior, and a streamed custom-protocol response. Packaged Windows and
-Linux builds still require final release validation. The architectural fallback remains
-a stable-port `*.veilid.localhost` origin, not fake certificates or disabled web
-security.
+secure-context behavior, and a streamed response. Packaged Windows and Linux builds
+still require final release validation.
 
 ## Streaming IPC
 
@@ -72,7 +86,7 @@ veilid-http ./example.veilidapp
 ```
 
 If `app.veilidapp` exists next to the executable, it is loaded automatically. This lets
-a developer distribute your unchanged signed runtime beside a tiny descriptor. Editing
+a developer distribute the unchanged signed runtime beside a tiny descriptor. Editing
 files inside a signed executable would invalidate its signature; the sibling descriptor
 does not.
 
@@ -98,14 +112,15 @@ public HTTPS requests, CSP, CORS, and browser-managed persistence.
 No arbitrary filesystem access means the page cannot silently enumerate/read paths. A
 user may still select files or a download destination just as in a normal browser.
 Ordinary public HTTPS calls stay on Chromium's network stack under normal browser rules.
-Only `veilid://` origins enter VHTTP.
+Only requests to validated `*.veilid.localhost` site origins enter VHTTP.
 
 ## Cross-origin Veilid requests
 
-Each imported RouteBlob becomes another virtual origin. A call from one Veilid site to
-another is cross-origin and Chromium enforces ordinary CORS. The server's forwarded
-`Origin` header is not authentication; applications still use real sessions, tokens, or
-cryptographic identity where required.
+Each imported RouteBlob becomes another loopback origin. A call from one Veilid site to
+another is cross-origin and Chromium enforces ordinary CORS. The bridge can still expose
+an overlay identity such as `veilid://<fingerprint>` in trusted forwarding metadata, but
+that value is not the renderer's literal URL and is not authentication. Applications
+still use real sessions, tokens, or cryptographic identity where required.
 
 ## Site storage
 

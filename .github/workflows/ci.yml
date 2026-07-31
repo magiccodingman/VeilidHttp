@@ -27,17 +27,12 @@ jobs:
           toolchain: 1.89.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo metadata --no-deps --format-version 1 >/dev/null
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
-      - name: Preserve generated Cargo lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: cargo-lock
-          path: Cargo.lock
-          if-no-files-found: ignore
+          cache-on-failure: true
+      - run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-features
 
   electron:
     runs-on: ubuntu-latest
@@ -55,20 +50,26 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
-      - name: Verify service workers, storage, CORS, and streams on veilid://
-        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron test/electron-pwa-smoke.cjs
+      - name: Verify service workers, storage, CORS, and streams on localhost origins
+        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
-      - name: Preserve generated pnpm lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pnpm-lock
-          path: pnpm-lock.yaml
-          if-no-files-found: ignore
+      - name: Prepare packaged transport fixture
+        run: |
+          mkdir -p target/release
+          printf '#!/bin/sh\nexit 1\n' > target/release/veilid-http-native
+          chmod +x target/release/veilid-http-native
+      - name: Package hardened Electron client
+        run: pnpm --filter @veilid-http/electron package -- --platform=linux --arch=x64
+      - name: Report packaged Electron fuses
+        run: |
+          app_dir="$(find "$GITHUB_WORKSPACE/apps/veilid-http-electron/out" -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
+          binary="$app_dir/veilid-http"
+          test -x "$binary"
+          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$binary"
 
   compose:
     runs-on: ubuntu-latest

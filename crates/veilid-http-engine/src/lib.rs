@@ -6,4 +6,4 @@ mod outgoing;
 
 pub use error::EngineError;
 pub use incoming::{InboundBody, ReceiveOutput};
-pub use outgoing::{OutboundBody, RetainedFrame};
+pub use outgoing::{OutboundBody, OutboundBodyConfig, RetainedFrame};

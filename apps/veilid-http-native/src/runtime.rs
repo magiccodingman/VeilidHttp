@@ -11,11 +11,11 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_http::{RequestHead, ResponseHead};
 use veilid_http_stream::{
-    CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode,
-    encode_ack, encode_cancel, encode_request_open,
+    CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode, encode_ack,
+    encode_cancel, encode_request_open,
 };
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_native::NativeVeilidTransport;
@@ -286,7 +286,10 @@ impl ClientRuntime {
     ) -> Result<()> {
         let transaction_id = rand::random::<[u8; 16]>();
         let (event_sender, mut events) = mpsc::unbounded_channel();
-        self.transactions.lock().await.insert(transaction_id, event_sender);
+        self.transactions
+            .lock()
+            .await
+            .insert(transaction_id, event_sender);
         let result = self
             .run_stream_inner(
                 transaction_id,
@@ -362,7 +365,11 @@ impl ClientRuntime {
                 value.request_receive_window
             }
             DecodedFrame::Error { value, .. } => {
-                bail!("server rejected RequestOpen: {}: {}", value.code, value.message);
+                bail!(
+                    "server rejected RequestOpen: {}: {}",
+                    value.code,
+                    value.message
+                );
             }
             other => bail!("unexpected streamed AppCall reply: {other:?}"),
         };
@@ -371,12 +378,14 @@ impl ClientRuntime {
             let mut sender = OutboundBody::new(
                 transaction_id,
                 StreamDirection::Request,
-                CompressionMode::Zstd,
-                3,
-                self.frame_bytes,
-                256,
-                self.window_frames,
-                self.max_pending_bytes,
+                OutboundBodyConfig {
+                    compression: CompressionMode::Zstd,
+                    zstd_level: 3,
+                    frame_limit: self.frame_bytes,
+                    reserved_metadata: 256,
+                    window_frames: self.window_frames,
+                    max_pending_bytes: self.max_pending_bytes,
+                },
             )?;
             sender.set_peer_window(request_receive_window)?;
             Some(sender)
@@ -570,24 +579,17 @@ impl ClientRuntime {
         self.send_encoded_frames(target, frames).await
     }
 
-    async fn send_encoded_frames(
-        &self,
-        target: &RouteTarget,
-        frames: Vec<Bytes>,
-    ) -> Result<()> {
+    async fn send_encoded_frames(&self, target: &RouteTarget, frames: Vec<Bytes>) -> Result<()> {
         let mut bundle = Vec::new();
         let mut encoded_bytes = 8_usize;
         for frame in frames {
-            let projected = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            let projected = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             if !bundle.is_empty() && projected > VEILID_MESSAGE_LIMIT {
-                self.send_bundle(target, std::mem::take(&mut bundle)).await?;
+                self.send_bundle(target, std::mem::take(&mut bundle))
+                    .await?;
                 encoded_bytes = 8;
             }
-            encoded_bytes = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            encoded_bytes = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             bundle.push(frame);
         }
         if !bundle.is_empty() {
@@ -614,12 +616,17 @@ impl ClientRuntime {
                 TransportEvent::AppMessage { route, payload } => {
                     let current = self.return_route.read().await.clone();
                     if route.as_ref() != Some(&current.target) {
-                        tracing::debug!(?route, "ignored AppMessage for a non-current client return route");
+                        tracing::debug!(
+                            ?route,
+                            "ignored AppMessage for a non-current client return route"
+                        );
                         continue;
                     }
                     for encoded in split_frames(payload)? {
                         let transaction_id = Frame::decode(encoded.clone())?.transaction_id;
-                        if let Some(sender) = self.transactions.lock().await.get(&transaction_id).cloned() {
+                        if let Some(sender) =
+                            self.transactions.lock().await.get(&transaction_id).cloned()
+                        {
                             let _ = sender.send(encoded);
                         }
                     }
@@ -632,7 +639,8 @@ impl ClientRuntime {
                     if route == current.target {
                         tracing::warn!(fingerprint = %current.fingerprint, "client return route died; rotating and failing active requests");
                         self.transactions.lock().await.clear();
-                        let replacement = allocate_return_route(&self.transport, &self.data_dir).await?;
+                        let replacement =
+                            allocate_return_route(&self.transport, &self.data_dir).await?;
                         *self.return_route.write().await = replacement;
                     }
                 }
@@ -668,8 +676,7 @@ async fn allocate_return_route(
 
 fn persist_return_route(data_dir: &Path, route: &ReturnRoute) -> Result<()> {
     let directory = data_dir.join("return-route");
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("create {}", directory.display()))?;
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     atomic_write(&directory.join("current.blob"), &route.blob)?;
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
