@@ -435,6 +435,7 @@ async fn handle_atomic_call(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
     let endpoint = config
         .veilid_client_endpoint
@@ -526,17 +527,17 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
                             .await
                         {
                             tracing::error!(%error, "failed to accept streamed RequestOpen");
-                            if let Ok(frame) = veilid_http_wire::Frame::decode(payload) {
-                                if let Ok(encoded) = encode_error(
+                            if let Ok(frame) = veilid_http_wire::Frame::decode(payload)
+                                && let Ok(encoded) = encode_error(
                                     frame.transaction_id,
                                     &StreamError {
                                         code: "request-open-rejected".to_owned(),
                                         message: error.to_string(),
                                         retryable: false,
                                     },
-                                ) {
-                                    let _ = transport.app_call_reply(&call_id, encoded).await;
-                                }
+                                )
+                            {
+                                let _ = transport.app_call_reply(&call_id, encoded).await;
                             }
                         }
                     });
