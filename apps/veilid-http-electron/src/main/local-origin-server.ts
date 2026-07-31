@@ -2,9 +2,8 @@ import { once } from 'node:events';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { Sidecar } from './sidecar';
-import { siteIdFromHostname } from '../shared/site-id';
+import { DEFAULT_LOCAL_ORIGIN_PORT, siteIdFromHostname } from '../shared/site-id';
 
-export const DEFAULT_LOCAL_ORIGIN_PORT = 43127;
 const LOOPBACK_ADDRESS = '127.0.0.1';
 
 export function configuredLocalOriginPort(value = process.env.VHTTP_LOCAL_ORIGIN_PORT): number {
@@ -104,7 +103,7 @@ export async function startLocalOriginServer(sidecar: Sidecar, port: number): Pr
     const method = request.method ?? 'GET';
     const hasRequestBody = !['GET', 'HEAD'].includes(method.toUpperCase());
     const body = hasRequestBody
-      ? Readable.toWeb(request) as ReadableStream<Uint8Array>
+      ? (Readable.toWeb(request) as ReadableStream<Uint8Array>)
       : null;
 
     try {
