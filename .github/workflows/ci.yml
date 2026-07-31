@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, agent/initial-veilid-http]
   pull_request:
   workflow_dispatch:
 
