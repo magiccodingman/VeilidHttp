@@ -14,6 +14,51 @@ permissions:
   contents: read
 
 jobs:
+  maintain-draft:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout trusted PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+          run_install: false
+      - name: Format Rust and generate lockfiles
+        run: |
+          cargo fmt --all
+          cargo generate-lockfile
+          pnpm install --lockfile-only
+      - name: Commit maintenance output
+        run: |
+          if git diff --quiet -- Cargo.lock pnpm-lock.yaml '*.rs'; then
+            echo 'Workspace already formatted and locked.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock pnpm-lock.yaml
+          git add -- '*.rs'
+          git commit -m 'Apply rustfmt and commit lockfiles'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
