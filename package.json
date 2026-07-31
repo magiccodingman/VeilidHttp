@@ -1,0 +1,12 @@
+{
+  "name": "veilid-http",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "packageManager": "pnpm@10.13.1",
+  "scripts": {
+    "build": "pnpm --filter @veilid-http/electron build",
+    "test": "node scripts/smoke-http-fixtures.mjs && pnpm --filter @veilid-http/electron test",
+    "electron:dev": "pnpm --filter @veilid-http/electron dev",
+    "electron:package": "cargo build --release -p veilid-http-native && pnpm --filter @veilid-http/electron package"
+  }
+}

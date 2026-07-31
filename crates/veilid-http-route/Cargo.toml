@@ -1,0 +1,16 @@
+[package]
+name = "veilid-http-route"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

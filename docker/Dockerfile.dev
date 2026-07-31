@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+ARG RUST_VERSION=1.89.0
+ARG DEBIAN_VERSION=13.6
+
+FROM rust:${RUST_VERSION}-trixie
+ARG TARGETARCH=amd64
+ARG VEILID_RELEASE_CHANNEL=stable
+ARG VEILID_VERSION=0.5.5
+ENV VEILID_EXPECTED_VERSION_PREFIX=${VEILID_VERSION}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg tini procps netcat-openbsd \
+    && curl -fsSL https://packages.veilid.net/gpg/veilid-packages-key.public \
+      | gpg --dearmor -o /usr/share/keyrings/veilid-packages-keyring.gpg \
+    && echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/veilid-packages-keyring.gpg] https://packages.veilid.net/apt ${VEILID_RELEASE_CHANNEL} main" \
+      > /etc/apt/sources.list.d/veilid.list \
+    && apt-get update \
+    && resolved_version="$(apt-cache madison veilid-server \
+         | awk -v prefix="${VEILID_VERSION}" '$3 ~ ("^" prefix "([-+~:]|$)") { print $3; exit }')" \
+    && test -n "${resolved_version}" \
+    && apt-cache madison veilid-cli \
+         | awk -v version="${resolved_version}" '$3 == version { found=1 } END { exit !found }' \
+    && apt-get install -y --no-install-recommends \
+         "veilid-server=${resolved_version}" \
+         "veilid-cli=${resolved_version}" \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh /usr/local/bin/
+COPY docker/veilid-server.conf /etc/veilid-server/veilid-server.conf
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.dev.sh /usr/local/bin/healthcheck.sh \
+    && install -d -o veilid -g veilid /data/veilid /data/bridge
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.dev.sh"]

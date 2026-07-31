@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'" />
+  <title>VeilidHttp</title>
+</head>
+<body>
+  <main>
+    <h1>VeilidHttp</h1>
+    <p>Load an ordinary web application through a private Veilid RouteBlob.</p>
+    <form id="open-route">
+      <label for="route">RouteBlob (unpadded Base64URL)</label>
+      <textarea id="route" rows="2" autocomplete="off" spellcheck="false" placeholder="Paste a private RouteBlob"></textarea>
+      <button type="submit">Open route</button>
+    </form>
+    <p id="status" role="status"></p>
+  </main>
+</body>
+</html>

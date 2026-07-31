@@ -1,0 +1,133 @@
+# VeilidHttp mixed Rust / Electron / .NET repository
+
+# OS and filesystem noise
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+secrets/
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Runtime and persistent data
+data/
+!data/.gitkeep
+runtime/
+spool/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.route
+*.routeblob
+*.veilidapp.local
+
+# Rust / Cargo
+target/
+**/target/
+Cargo.lock
+!Cargo.lock
+*.rs.bk
+.cargo/config.local.toml
+
+# JavaScript / TypeScript / Electron
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.yarn-cache/
+.yarn-integrity
+.pnp.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+coverage/
+.nyc_output/
+dist/
+out/
+build/
+release/
+artifacts/
+.webpack/
+.vite/
+.parcel-cache/
+.electron-cache/
+Electron userData/
+
+# Electron Forge output
+apps/veilid-http-electron/out/
+apps/veilid-http-electron/.webpack/
+apps/veilid-http-electron/.vite/
+
+# .NET / C# / Visual Studio (future adapters and samples)
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+.vs/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.csproj.user
+*.DotSettings.user
+TestResults/
+*.coverage
+*.coveragexml
+*.trx
+_ReSharper*/
+*.resharper
+*.ncrunch*
+*.crunchsolution.local.xml
+BenchmarkDotNet.Artifacts/
+.nuget/
+packages/
+!**/packages/build/
+!**/packages/repositories.config
+
+# JetBrains Rider / IntelliJ
+.idea/
+*.iws
+*.iml
+*.ipr
+.idea_modules/
+
+# Editors
+*.swp
+*.swo
+*~
+.history/
+
+# Testing and generated fixtures
+playwright-report/
+test-results/
+blob-report/
+protocol-tests/generated/
+
+# Docker local overrides
+docker-compose.override.yml
+compose.override.yaml
+*.pid

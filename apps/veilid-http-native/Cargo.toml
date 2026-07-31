@@ -1,0 +1,30 @@
+[package]
+name = "veilid-http-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+veilid-http-core = { path = "../../crates/veilid-http-core" }
+veilid-http-engine = { path = "../../crates/veilid-http-engine" }
+veilid-http-http = { path = "../../crates/veilid-http-http" }
+veilid-http-ipc = { path = "../../crates/veilid-http-ipc" }
+veilid-http-route = { path = "../../crates/veilid-http-route" }
+veilid-http-stream = { path = "../../crates/veilid-http-stream" }
+veilid-http-transport = { path = "../../crates/veilid-http-transport" }
+veilid-http-veilid-native = { path = "../../crates/veilid-http-veilid-native" }
+veilid-http-wire = { path = "../../crates/veilid-http-wire" }
+
+[lints]
+workspace = true
