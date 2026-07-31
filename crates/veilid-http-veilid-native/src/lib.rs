@@ -7,14 +7,12 @@ use std::{
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use veilid_core::{
-    api_startup_json, OperationId, RouteId, RoutingContext, UpdateCallback, VeilidAPI,
-    VeilidAPIError, VeilidConfig, VeilidUpdate,
+    OperationId, RouteId, RoutingContext, UpdateCallback, VeilidAPI, VeilidAPIError, VeilidConfig,
+    VeilidUpdate, api_startup_json,
 };
-use veilid_http_transport::{
-    RouteTarget, TransportError, TransportEvent, VeilidTransport,
-};
+use veilid_http_transport::{RouteTarget, TransportError, TransportEvent, VeilidTransport};
 
 /// Configuration for an embedded native Veilid node.
 #[derive(Debug, Clone)]
@@ -55,7 +53,9 @@ pub struct NativeVeilidTransport {
 
 impl std::fmt::Debug for NativeVeilidTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("NativeVeilidTransport").finish_non_exhaustive()
+        formatter
+            .debug_struct("NativeVeilidTransport")
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,7 +114,10 @@ impl NativeVeilidTransport {
 
 fn path_to_utf8(path: &Path) -> Result<&str, TransportError> {
     path.to_str().ok_or_else(|| {
-        TransportError::Fatal(format!("Veilid storage path is not valid UTF-8: {}", path.display()))
+        TransportError::Fatal(format!(
+            "Veilid storage path is not valid UTF-8: {}",
+            path.display()
+        ))
     })
 }
 
@@ -125,7 +128,9 @@ fn map_update(
 ) {
     match update {
         VeilidUpdate::AppMessage(message) => {
-            let route = message.route_id().map(|route| RouteTarget(route.to_string()));
+            let route = message
+                .route_id()
+                .map(|route| RouteTarget(route.to_string()));
             let _ = sender.send(TransportEvent::AppMessage {
                 route,
                 payload: Bytes::copy_from_slice(message.message()),
@@ -198,7 +203,10 @@ impl VeilidTransport for NativeVeilidTransport {
 
     async fn allocate_route(&self) -> Result<(RouteTarget, Bytes), TransportError> {
         let route = self.api.new_private_route().await.map_err(classify_error)?;
-        Ok((RouteTarget(route.route_id.to_string()), Bytes::from(route.blob)))
+        Ok((
+            RouteTarget(route.route_id.to_string()),
+            Bytes::from(route.blob),
+        ))
     }
 
     async fn release_route(&self, target: &RouteTarget) -> Result<(), TransportError> {
@@ -230,17 +238,15 @@ impl VeilidTransport for NativeVeilidTransport {
             .map_err(classify_error)
     }
 
-    async fn app_call_reply(
-        &self,
-        call_id: &str,
-        payload: Bytes,
-    ) -> Result<(), TransportError> {
+    async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError> {
         let operation_id = self
             .pending_calls
             .lock()
             .map_err(|_| TransportError::Fatal("pending-call registry was poisoned".to_owned()))?
             .remove(call_id)
-            .ok_or_else(|| TransportError::InvalidTarget("unknown or already-replied AppCall".to_owned()))?;
+            .ok_or_else(|| {
+                TransportError::InvalidTarget("unknown or already-replied AppCall".to_owned())
+            })?;
         self.api
             .app_call_reply(operation_id, payload.to_vec())
             .await

@@ -12,9 +12,16 @@ pub struct RouteTarget(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportEvent {
     /// One-way AppMessage payload.
-    AppMessage { route: Option<RouteTarget>, payload: Bytes },
+    AppMessage {
+        route: Option<RouteTarget>,
+        payload: Bytes,
+    },
     /// AppCall expecting a reply through the adapter-specific call identifier.
-    AppCall { call_id: String, route: Option<RouteTarget>, payload: Bytes },
+    AppCall {
+        call_id: String,
+        route: Option<RouteTarget>,
+        payload: Bytes,
+    },
     /// A route died or was released.
     RouteChanged { route: RouteTarget, dead: bool },
     /// The underlying Veilid node shut down.
@@ -51,9 +58,11 @@ pub trait VeilidTransport: Send + Sync {
     /// Release a locally allocated or remotely imported private route.
     async fn release_route(&self, target: &RouteTarget) -> Result<(), TransportError>;
     /// Send an AppCall and await its application reply.
-    async fn app_call(&self, target: &RouteTarget, payload: Bytes) -> Result<Bytes, TransportError>;
+    async fn app_call(&self, target: &RouteTarget, payload: Bytes)
+    -> Result<Bytes, TransportError>;
     /// Dispatch a one-way AppMessage.
-    async fn app_message(&self, target: &RouteTarget, payload: Bytes) -> Result<(), TransportError>;
+    async fn app_message(&self, target: &RouteTarget, payload: Bytes)
+    -> Result<(), TransportError>;
     /// Reply exactly once to an inbound AppCall.
     async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError>;
     /// Receive the next adapter event.

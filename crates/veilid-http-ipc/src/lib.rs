@@ -319,13 +319,8 @@ mod tests {
             direction: IpcStreamDirection::Response,
             credits: 4,
         };
-        let expected = IpcFrame::from_metadata(
-            FrameKind::StreamCredit,
-            73,
-            &credit,
-            Bytes::new(),
-        )
-        .unwrap();
+        let expected =
+            IpcFrame::from_metadata(FrameKind::StreamCredit, 73, &credit, Bytes::new()).unwrap();
         let sent = expected.clone();
         let writer = tokio::spawn(async move { write_frame(&mut client, &sent).await.unwrap() });
         let received = read_frame(&mut server).await.unwrap();

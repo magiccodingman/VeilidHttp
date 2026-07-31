@@ -69,8 +69,14 @@ pub fn normalize_request(mut request: RequestHead) -> Result<RequestHead, HttpTr
 #[must_use]
 pub fn strip_hop_by_hop(headers: Vec<HeaderField>) -> Vec<HeaderField> {
     let mut denied: HashSet<String> = [
-        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-        "te", "trailer", "transfer-encoding", "upgrade",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -78,7 +84,12 @@ pub fn strip_hop_by_hop(headers: Vec<HeaderField>) -> Vec<HeaderField> {
 
     for header in &headers {
         if header.name.eq_ignore_ascii_case("connection") {
-            denied.extend(header.value.split(',').map(|value| value.trim().to_ascii_lowercase()));
+            denied.extend(
+                header
+                    .value
+                    .split(',')
+                    .map(|value| value.trim().to_ascii_lowercase()),
+            );
         }
     }
 
@@ -96,7 +107,8 @@ pub fn upstream_url(base: &str, path_and_query: &str) -> Result<Url, HttpTransla
     }
     base.set_path("");
     base.set_query(None);
-    base.join(path_and_query).map_err(|_| HttpTranslationError::InvalidUpstream)
+    base.join(path_and_query)
+        .map_err(|_| HttpTranslationError::InvalidUpstream)
 }
 
 /// Remove spoofed route headers and add bridge-trusted values.
@@ -109,7 +121,10 @@ pub fn attach_route_headers(
         !header.name.eq_ignore_ascii_case(route_header)
             && !header.name.eq_ignore_ascii_case("X-Veilid-Origin")
     });
-    headers.push(HeaderField { name: route_header.to_owned(), value: fingerprint.to_owned() });
+    headers.push(HeaderField {
+        name: route_header.to_owned(),
+        value: fingerprint.to_owned(),
+    });
     headers.push(HeaderField {
         name: "X-Veilid-Origin".to_owned(),
         value: format!("veilid://{fingerprint}"),
@@ -124,9 +139,18 @@ mod tests {
     #[test]
     fn strips_connection_declared_headers() {
         let headers = vec![
-            HeaderField { name: "Connection".into(), value: "X-Remove".into() },
-            HeaderField { name: "X-Remove".into(), value: "bad".into() },
-            HeaderField { name: "Content-Type".into(), value: "text/plain".into() },
+            HeaderField {
+                name: "Connection".into(),
+                value: "X-Remove".into(),
+            },
+            HeaderField {
+                name: "X-Remove".into(),
+                value: "bad".into(),
+            },
+            HeaderField {
+                name: "Content-Type".into(),
+                value: "text/plain".into(),
+            },
         ];
         let result = strip_hop_by_hop(headers);
         assert_eq!(result.len(), 1);
@@ -135,12 +159,25 @@ mod tests {
 
     #[test]
     fn supports_normal_methods_but_not_raw_connect_tunnels() {
-        for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"] {
-            let request = RequestHead { method: method.into(), path_and_query: "/".into(), headers: Vec::new() };
+        for method in [
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE",
+        ] {
+            let request = RequestHead {
+                method: method.into(),
+                path_and_query: "/".into(),
+                headers: Vec::new(),
+            };
             assert!(normalize_request(request).is_ok(), "{method}");
         }
-        let connect = RequestHead { method: "CONNECT".into(), path_and_query: "/".into(), headers: Vec::new() };
-        assert_eq!(normalize_request(connect), Err(HttpTranslationError::ConnectUnsupported));
+        let connect = RequestHead {
+            method: "CONNECT".into(),
+            path_and_query: "/".into(),
+            headers: Vec::new(),
+        };
+        assert_eq!(
+            normalize_request(connect),
+            Err(HttpTranslationError::ConnectUnsupported)
+        );
     }
 
     #[test]
@@ -150,13 +187,18 @@ mod tests {
             path_and_query: "https://evil.example:9000/".into(),
             headers: Vec::new(),
         };
-        assert_eq!(normalize_request(request), Err(HttpTranslationError::AbsoluteUriForbidden));
+        assert_eq!(
+            normalize_request(request),
+            Err(HttpTranslationError::AbsoluteUriForbidden)
+        );
     }
 
     #[test]
     fn joins_path_to_single_upstream() {
         assert_eq!(
-            upstream_url("http://proxy:8080/base", "/api?q=1").unwrap().as_str(),
+            upstream_url("http://proxy:8080/base", "/api?q=1")
+                .unwrap()
+                .as_str(),
             "http://proxy:8080/api?q=1"
         );
     }
@@ -164,7 +206,10 @@ mod tests {
     #[test]
     fn overwrites_spoofed_route_metadata() {
         let result = attach_route_headers(
-            vec![HeaderField { name: "X-Veilid-Route-Fingerprint".into(), value: "fake".into() }],
+            vec![HeaderField {
+                name: "X-Veilid-Route-Fingerprint".into(),
+                value: "fake".into(),
+            }],
             "real",
             "X-Veilid-Route-Fingerprint",
         );
@@ -281,7 +326,11 @@ pub fn decode_atomic_request(
     let head: RequestHead = decode_head(&frame, REQUEST_HEAD_EXTENSION)?;
     let head = normalize_request(head)?;
     let body = decode_body(&frame, max_logical_body)?;
-    Ok(AtomicRequest { transaction_id: frame.transaction_id, head, body })
+    Ok(AtomicRequest {
+        transaction_id: frame.transaction_id,
+        head,
+        body,
+    })
 }
 
 /// Encode one complete response into an AppCall reply `ATOMIC_RESPONSE` frame.
@@ -296,7 +345,10 @@ pub fn encode_atomic_response(
     body: &[u8],
     compress_body: bool,
 ) -> Result<bytes::Bytes, AtomicCodecError> {
-    let head = ResponseHead { status: head.status, headers: strip_hop_by_hop(head.headers) };
+    let head = ResponseHead {
+        status: head.status,
+        headers: strip_hop_by_hop(head.headers),
+    };
     encode_atomic_frame(
         veilid_http_wire::FrameType::AtomicResponse,
         transaction_id,
@@ -326,7 +378,11 @@ pub fn decode_atomic_response(
     let mut head: ResponseHead = decode_head(&frame, RESPONSE_HEAD_EXTENSION)?;
     head.headers = strip_hop_by_hop(head.headers);
     let body = decode_body(&frame, max_logical_body)?;
-    Ok(AtomicResponse { transaction_id: frame.transaction_id, head, body })
+    Ok(AtomicResponse {
+        transaction_id: frame.transaction_id,
+        head,
+        body,
+    })
 }
 
 fn encode_atomic_frame<T: Serialize>(
@@ -348,12 +404,21 @@ fn encode_atomic_frame<T: Serialize>(
     };
     let digest = veilid_http_core::stream_digest(body);
     let mut metadata = veilid_http_wire::Metadata::default();
-    metadata.extensions.insert(extension_name.to_owned(), encoded_head);
+    metadata
+        .extensions
+        .insert(extension_name.to_owned(), encoded_head);
     metadata.vhttp.insert(
         COMPRESSION_KEY.to_owned(),
-        if compress_body && !body.is_empty() { "zstd" } else { "none" }.to_owned(),
+        if compress_body && !body.is_empty() {
+            "zstd"
+        } else {
+            "none"
+        }
+        .to_owned(),
     );
-    metadata.vhttp.insert(LOGICAL_LENGTH_KEY.to_owned(), body.len().to_string());
+    metadata
+        .vhttp
+        .insert(LOGICAL_LENGTH_KEY.to_owned(), body.len().to_string());
     metadata.vhttp.insert(
         DIGEST_KEY.to_owned(),
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest),
@@ -398,12 +463,19 @@ fn decode_body(
         .parse::<usize>()
         .map_err(|_| AtomicCodecError::InvalidBodyMetadata)?;
     if logical_length > max_logical_body {
-        return Err(AtomicCodecError::Core(veilid_http_core::CoreError::DecompressedLimit {
-            actual: logical_length,
-            limit: max_logical_body,
-        }));
+        return Err(AtomicCodecError::Core(
+            veilid_http_core::CoreError::DecompressedLimit {
+                actual: logical_length,
+                limit: max_logical_body,
+            },
+        ));
     }
-    let body = match frame.metadata.vhttp.get(COMPRESSION_KEY).map(String::as_str) {
+    let body = match frame
+        .metadata
+        .vhttp
+        .get(COMPRESSION_KEY)
+        .map(String::as_str)
+    {
         Some("none") => frame.payload.to_vec(),
         Some("zstd") => veilid_http_core::decompress_bounded(&frame.payload, max_logical_body)?,
         _ => return Err(AtomicCodecError::InvalidBodyMetadata),
@@ -454,7 +526,10 @@ mod atomic_tests {
     fn atomic_response_rejects_wrong_transaction() {
         let encoded = encode_atomic_response(
             [1; 16],
-            ResponseHead { status: 200, headers: Vec::new() },
+            ResponseHead {
+                status: 200,
+                headers: Vec::new(),
+            },
             b"hello",
             false,
         )

@@ -42,19 +42,17 @@ impl FromStr for RemoteEndpoint {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if let Some(address) = value.strip_prefix("tcp://") {
-            return address
-                .parse()
-                .map(Self::Tcp)
-                .map_err(|error| TransportError::Fatal(format!("invalid Veilid TCP endpoint: {error}")));
+            return address.parse().map(Self::Tcp).map_err(|error| {
+                TransportError::Fatal(format!("invalid Veilid TCP endpoint: {error}"))
+            });
         }
         #[cfg(unix)]
         if let Some(path) = value.strip_prefix("unix://") {
             return Ok(Self::Unix(PathBuf::from(path)));
         }
-        value
-            .parse()
-            .map(Self::Tcp)
-            .map_err(|error| TransportError::Fatal(format!("invalid Veilid client endpoint: {error}")))
+        value.parse().map(Self::Tcp).map_err(|error| {
+            TransportError::Fatal(format!("invalid Veilid client endpoint: {error}"))
+        })
     }
 }
 
@@ -102,7 +100,9 @@ impl RemoteVeilidTransport {
             RemoteEndpoint::Unix(path) => {
                 let stream = tokio::net::UnixStream::connect(&path)
                     .await
-                    .map_err(|error| TransportError::Retryable(format!("{}: {error}", path.display())))?;
+                    .map_err(|error| {
+                        TransportError::Retryable(format!("{}: {error}", path.display()))
+                    })?;
                 Self::from_stream(stream, request_timeout).await
             }
         }
@@ -161,7 +161,10 @@ impl RemoteVeilidTransport {
                     }
                 }
                 if line.len() > MAX_REMOTE_LINE_BYTES {
-                    tracing::error!(bytes = line.len(), "Veilid remote message exceeded safety bound");
+                    tracing::error!(
+                        bytes = line.len(),
+                        "Veilid remote message exceeded safety bound"
+                    );
                     break;
                 }
                 while matches!(line.last(), Some(b'\n' | b'\r')) {
@@ -202,7 +205,11 @@ impl RemoteVeilidTransport {
 
         client.server_version = match client.request(RequestOp::VeilidVersionString).await? {
             ResponseOp::VeilidVersionString { value } => value,
-            _ => return Err(TransportError::Fatal("unexpected version response".to_owned())),
+            _ => {
+                return Err(TransportError::Fatal(
+                    "unexpected version response".to_owned(),
+                ));
+            }
         };
 
         if let ResponseOp::Attach { result } = client.request(RequestOp::Attach).await? {
@@ -212,12 +219,18 @@ impl RemoteVeilidTransport {
                 }
             }
         } else {
-            return Err(TransportError::Fatal("unexpected attach response".to_owned()));
+            return Err(TransportError::Fatal(
+                "unexpected attach response".to_owned(),
+            ));
         }
 
         client.routing_context_id = match client.request(RequestOp::NewRoutingContext).await? {
             ResponseOp::NewRoutingContext { result } => unwrap_api_result(result)?,
-            _ => return Err(TransportError::Fatal("unexpected routing-context response".to_owned())),
+            _ => {
+                return Err(TransportError::Fatal(
+                    "unexpected routing-context response".to_owned(),
+                ));
+            }
         };
         Ok(client)
     }
@@ -257,7 +270,9 @@ impl RemoteVeilidTransport {
             ResponseOp::RoutingContext(response) if response.rc_id == self.routing_context_id => {
                 Ok(response.rc_op)
             }
-            _ => Err(TransportError::Fatal("unexpected routing-context operation response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected routing-context operation response".to_owned(),
+            )),
         }
     }
 }
@@ -269,7 +284,9 @@ async fn map_update(
 ) {
     match update {
         VeilidUpdate::AppMessage(message) => {
-            let route = message.route_id().map(|route| RouteTarget(route.to_string()));
+            let route = message
+                .route_id()
+                .map(|route| RouteTarget(route.to_string()));
             let _ = sender.send(TransportEvent::AppMessage {
                 route,
                 payload: Bytes::copy_from_slice(message.message()),
@@ -277,7 +294,10 @@ async fn map_update(
         }
         VeilidUpdate::AppCall(call) => {
             let call_id = call.id().to_string();
-            pending_calls.lock().await.insert(call_id.clone(), call.id());
+            pending_calls
+                .lock()
+                .await
+                .insert(call_id.clone(), call.id());
             let route = call.route_id().map(|route| RouteTarget(route.to_string()));
             let _ = sender.send(TransportEvent::AppCall {
                 call_id,
@@ -358,7 +378,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             ResponseOp::ImportRemotePrivateRoute { result } => {
                 Ok(RouteTarget(unwrap_string_result(result)?))
             }
-            _ => Err(TransportError::Fatal("unexpected import-route response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected import-route response".to_owned(),
+            )),
         }
     }
 
@@ -366,9 +388,14 @@ impl VeilidTransport for RemoteVeilidTransport {
         match self.request(RequestOp::NewPrivateRoute).await? {
             ResponseOp::NewPrivateRoute { result } => {
                 let route = unwrap_api_result(result)?;
-                Ok((RouteTarget(route.route_id.to_string()), Bytes::from(route.blob)))
+                Ok((
+                    RouteTarget(route.route_id.to_string()),
+                    Bytes::from(route.blob),
+                ))
             }
-            _ => Err(TransportError::Fatal("unexpected new-route response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected new-route response".to_owned(),
+            )),
         }
     }
 
@@ -380,7 +407,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             .await?
         {
             ResponseOp::ReleasePrivateRoute { result } => unwrap_api_result(result),
-            _ => Err(TransportError::Fatal("unexpected release-route response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected release-route response".to_owned(),
+            )),
         }
     }
 
@@ -399,7 +428,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             RoutingContextResponseOp::AppCall { result } => {
                 Ok(Bytes::from(unwrap_vec_result(result)?))
             }
-            _ => Err(TransportError::Fatal("unexpected AppCall response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected AppCall response".to_owned(),
+            )),
         }
     }
 
@@ -416,21 +447,21 @@ impl VeilidTransport for RemoteVeilidTransport {
             .await?
         {
             RoutingContextResponseOp::AppMessage { result } => unwrap_api_result(result),
-            _ => Err(TransportError::Fatal("unexpected AppMessage response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected AppMessage response".to_owned(),
+            )),
         }
     }
 
-    async fn app_call_reply(
-        &self,
-        call_id: &str,
-        payload: Bytes,
-    ) -> Result<(), TransportError> {
+    async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError> {
         let operation_id = self
             .pending_calls
             .lock()
             .await
             .remove(call_id)
-            .ok_or_else(|| TransportError::InvalidTarget("unknown or already-replied AppCall".to_owned()))?;
+            .ok_or_else(|| {
+                TransportError::InvalidTarget("unknown or already-replied AppCall".to_owned())
+            })?;
         match self
             .request(RequestOp::AppCallReply {
                 call_id: operation_id,
@@ -439,7 +470,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             .await?
         {
             ResponseOp::AppCallReply { result } => unwrap_api_result(result),
-            _ => Err(TransportError::Fatal("unexpected AppCall reply response".to_owned())),
+            _ => Err(TransportError::Fatal(
+                "unexpected AppCall reply response".to_owned(),
+            )),
         }
     }
 

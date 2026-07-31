@@ -1,6 +1,6 @@
 use crate::EngineError;
 use bytes::Bytes;
-use veilid_http_core::{ReceiveWindow, Reassembler};
+use veilid_http_core::{Reassembler, ReceiveWindow};
 use veilid_http_stream::{
     Ack, CompressionMode, DecodedFrame, StreamDecoder, StreamDirection, StreamEnd, decode,
 };
@@ -51,7 +51,11 @@ impl InboundBody {
         Ok(Self {
             transaction_id,
             direction,
-            decoder: Some(StreamDecoder::new(direction, compression, max_logical_length)?),
+            decoder: Some(StreamDecoder::new(
+                direction,
+                compression,
+                max_logical_length,
+            )?),
             receive: ReceiveWindow::default(),
             reassembler: Reassembler::new(max_out_of_order_bytes),
             capacity,
@@ -69,7 +73,12 @@ impl InboundBody {
     pub fn receive(&mut self, encoded: Bytes) -> Result<ReceiveOutput, EngineError> {
         let mut logical_chunks = Vec::new();
         match decode(encoded)? {
-            DecodedFrame::Data { transaction_id, direction, sequence, payload } => {
+            DecodedFrame::Data {
+                transaction_id,
+                direction,
+                sequence,
+                payload,
+            } => {
                 self.validate(transaction_id, direction)?;
                 if self.completed || !self.receive.record(sequence) {
                     return Ok(self.output(logical_chunks));
@@ -85,7 +94,11 @@ impl InboundBody {
                     }
                 }
             }
-            DecodedFrame::End { transaction_id, sequence, value } => {
+            DecodedFrame::End {
+                transaction_id,
+                sequence,
+                value,
+            } => {
                 self.validate(transaction_id, value.direction)?;
                 if self.completed {
                     return Ok(self.output(logical_chunks));
@@ -137,7 +150,9 @@ impl InboundBody {
     }
 
     fn try_finish(&mut self, output: &mut Vec<Bytes>) -> Result<(), EngineError> {
-        let Some((end_sequence, end)) = self.pending_end.clone() else { return Ok(()) };
+        let Some((end_sequence, end)) = self.pending_end.clone() else {
+            return Ok(());
+        };
         let contiguous = self.receive.snapshot().cumulative;
         let data_complete = match contiguous {
             Some(sequence) => sequence.checked_add(1) == Some(end_sequence),

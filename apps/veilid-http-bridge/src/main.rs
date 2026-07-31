@@ -15,16 +15,16 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use streaming::{StreamingBridge, StreamingConfig};
 use tokio::sync::RwLock;
 use url::Url;
 use veilid_http_http::{
-    HeaderField, ResponseHead, attach_route_headers, decode_atomic_request,
-    encode_atomic_response, upstream_url,
+    HeaderField, ResponseHead, attach_route_headers, decode_atomic_request, encode_atomic_response,
+    upstream_url,
 };
 use veilid_http_stream::{StreamError, encode_error};
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_remote::{RemoteEndpoint, RemoteVeilidTransport};
-use streaming::{StreamingBridge, StreamingConfig};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Translate VHTTP/1 transactions to one HTTP upstream")]
@@ -47,7 +47,11 @@ struct Config {
     frame_bytes: usize,
     #[arg(long, env = "VHTTP_SEND_WINDOW_FRAMES", default_value_t = 32)]
     send_window_frames: usize,
-    #[arg(long, env = "VHTTP_FORWARD_ROUTE_HEADER", default_value = "X-Veilid-Route-Fingerprint")]
+    #[arg(
+        long,
+        env = "VHTTP_FORWARD_ROUTE_HEADER",
+        default_value = "X-Veilid-Route-Fingerprint"
+    )]
     route_header: String,
     #[arg(long, env = "VHTTP_MAX_ATOMIC_BODY_BYTES", default_value_t = 8 * 1024 * 1024)]
     max_atomic_body_bytes: usize,
@@ -180,10 +184,7 @@ fn persist_route(data_dir: &Path, route: &ActiveRoute, veilid_version: &str) -> 
     Ok(())
 }
 
-async fn allocate_route(
-    transport: &RemoteVeilidTransport,
-    data_dir: &Path,
-) -> Result<ActiveRoute> {
+async fn allocate_route(transport: &RemoteVeilidTransport, data_dir: &Path) -> Result<ActiveRoute> {
     let (target, blob) = transport
         .allocate_route()
         .await
@@ -258,11 +259,8 @@ async fn forward_atomic(
     let target = upstream_url(&config.upstream_url, &request.head.path_and_query)?;
     let method = reqwest::Method::from_bytes(request.head.method.as_bytes())
         .context("parse reconstructed HTTP method")?;
-    let headers = attach_route_headers(
-        request.head.headers,
-        site_fingerprint,
-        &config.route_header,
-    );
+    let headers =
+        attach_route_headers(request.head.headers, site_fingerprint, &config.route_header);
     let mut upstream_request = client.request(method, target).body(request.body.clone());
     for header in headers {
         if header.name.eq_ignore_ascii_case("host")
@@ -351,11 +349,8 @@ async fn handle_atomic_call(
     let transaction_id = match veilid_http_wire::Frame::decode(payload.clone()) {
         Ok(frame) => frame.transaction_id,
         Err(error) => {
-            let response = small_error_response(
-                [0; 16],
-                400,
-                format!("invalid VHTTP frame: {error}"),
-            );
+            let response =
+                small_error_response([0; 16], 400, format!("invalid VHTTP frame: {error}"));
             if let Ok(response) = response {
                 let _ = transport.app_call_reply(&call_id, response).await;
             }
@@ -507,7 +502,11 @@ async fn run_live(config: Arc<Config>, upstream: Url) -> Result<()> {
     drop(current);
 
     loop {
-        match transport.next_event().await.context("receive Veilid update")? {
+        match transport
+            .next_event()
+            .await
+            .context("receive Veilid update")?
+        {
             TransportEvent::AppCall {
                 call_id,
                 route,
@@ -643,10 +642,7 @@ mod tests {
 
     #[test]
     fn route_files_are_atomically_published() {
-        let root = std::env::temp_dir().join(format!(
-            "veilid-http-bridge-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("veilid-http-bridge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         ensure_layout(&root).unwrap();
         let route = ActiveRoute {
@@ -655,10 +651,7 @@ mod tests {
             blob: Bytes::from_static(b"route"),
         };
         persist_route(&root, &route, "test").unwrap();
-        assert_eq!(
-            fs::read(root.join("route/current.blob")).unwrap(),
-            b"route"
-        );
+        assert_eq!(fs::read(root.join("route/current.blob")).unwrap(), b"route");
         assert!(root.join("route/current.json").is_file());
         assert!(root.join("route/current.base64").is_file());
         fs::remove_dir_all(root).unwrap();
