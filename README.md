@@ -66,6 +66,10 @@ expose arbitrary TCP or UDP tunnels. WebSockets, SignalR, WebTransport, and HTTP
 - `apps/veilid-http-cli`: route/status/export tooling.
 - `samples/`: static PWA and SSR/streaming compatibility fixtures.
 
+Both Veilid adapters construct explicit `Target::PrivateRoute` destinations for
+AppCall/AppMessage traffic. A RouteId is never treated as a node target or left to an
+implicit conversion.
+
 ## Development
 
 Requirements:
@@ -77,10 +81,10 @@ Requirements:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 
-pnpm install
+pnpm install --frozen-lockfile
 pnpm --filter @veilid-http/electron test
 pnpm --filter @veilid-http/electron build
 
