@@ -17,8 +17,11 @@ const STREAM_DATA = 4;
 const STREAM_END = 5;
 const CANCEL = 6;
 const EVENT = 7;
+const STREAM_CREDIT = 8;
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
+const INITIAL_RESPONSE_CREDITS = 4;
+const MAX_RESPONSE_CREDITS = 64;
 
 type ResponseEnvelope<T> = {
   ok: boolean;
@@ -38,6 +41,7 @@ type StreamPending = {
   rejectHead(error: Error): void;
   controller: ReadableStreamDefaultController<Uint8Array>;
   headResolved: boolean;
+  responseCredits: number;
   cleanup(): void;
 };
 
@@ -165,13 +169,11 @@ export class Sidecar {
       start(value) {
         controller = value;
       },
-      pull: () => {
-        if (this.socket?.isPaused()) this.socket.resume();
-      },
+      pull: () => this.grantResponseCredits(requestId),
       cancel: (reason) => {
         this.cancelStream(requestId, reason instanceof Error ? reason.message : String(reason ?? 'response cancelled'));
       },
-    }, { highWaterMark: 4 });
+    }, { highWaterMark: INITIAL_RESPONSE_CREDITS });
 
     let abortListener: (() => void) | undefined;
     const head = new Promise<T>((resolve, reject) => {
@@ -184,6 +186,7 @@ export class Sidecar {
         rejectHead: reject,
         controller,
         headResolved: false,
+        responseCredits: INITIAL_RESPONSE_CREDITS,
         cleanup,
       });
       abortListener = (): void => this.cancelStream(requestId, signal?.reason instanceof Error
@@ -201,13 +204,14 @@ export class Sidecar {
           type,
           ...fields,
           hasBody: requestBody !== null,
+          responseCredits: INITIAL_RESPONSE_CREDITS,
         }, Buffer.alloc(0));
       } catch (error) {
         this.failStream(requestId, toError(error), false);
       }
     });
 
-    if (requestBody !== null) {
+    if (!signal?.aborted && requestBody !== null) {
       void this.pumpRequestBody(requestId, requestBody).catch((error) => {
         this.failStream(requestId, toError(error), true);
       });
@@ -235,6 +239,24 @@ export class Sidecar {
       await this.writeFrameAsync(STREAM_END, requestId, {}, Buffer.alloc(0));
     } finally {
       reader.releaseLock();
+    }
+  }
+
+  private grantResponseCredits(requestId: bigint): void {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.kind !== 'stream') return;
+    const desired = Math.max(0, Math.min(
+      MAX_RESPONSE_CREDITS,
+      Math.floor(pending.controller.desiredSize ?? 0),
+    ));
+    const credits = desired - pending.responseCredits;
+    if (credits <= 0) return;
+    pending.responseCredits += credits;
+    try {
+      this.writeFrame(STREAM_CREDIT, requestId, { credits }, Buffer.alloc(0));
+    } catch (error) {
+      pending.responseCredits -= credits;
+      this.failStream(requestId, toError(error), false);
     }
   }
 
@@ -311,8 +333,12 @@ export class Sidecar {
           this.failAll(new Error('Received stream data for a unary IPC request'));
           return;
         }
+        if (pending.responseCredits <= 0) {
+          this.failStream(requestId, new Error('Sidecar exceeded this response stream credit window'), true);
+          continue;
+        }
+        pending.responseCredits -= 1;
         pending.controller.enqueue(new Uint8Array(payload));
-        if ((pending.controller.desiredSize ?? 1) <= 0) this.socket?.pause();
         continue;
       }
       if (kind === STREAM_END) {
@@ -348,7 +374,14 @@ export class Sidecar {
           pending.headResolved = true;
           pending.resolveHead(envelope.result);
         }
-        if (payload.length > 0) pending.controller.enqueue(new Uint8Array(payload));
+        if (payload.length > 0) {
+          if (pending.responseCredits <= 0) {
+            this.failStream(requestId, new Error('Sidecar exceeded this response stream credit window'), true);
+            continue;
+          }
+          pending.responseCredits -= 1;
+          pending.controller.enqueue(new Uint8Array(payload));
+        }
         continue;
       }
 
