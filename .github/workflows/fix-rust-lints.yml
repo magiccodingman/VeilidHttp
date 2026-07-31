@@ -1,73 +1,13 @@
 name: Fix Rust lint pass
 
 on:
-  push:
-    branches: [agent/initial-veilid-http]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  fix:
-    if: github.actor != 'github-actions[bot]'
+  disabled:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: agent/initial-veilid-http
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.89.0
-          components: rustfmt
-      - name: Preserve protocol names and retained convenience APIs
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          runtime = Path('apps/veilid-http-native/src/runtime.rs')
-          text = runtime.read_text()
-          text = text.replace(
-              '/// Complete response convenience type built on top of the streaming runtime.\n#[derive(Debug, Clone)]\npub struct BufferedResponse',
-              '/// Complete response convenience type built on top of the streaming runtime.\n#[allow(dead_code)]\n#[derive(Debug, Clone)]\npub struct BufferedResponse',
-          )
-          text = text.replace(
-              '    /// Request cancellation of the remote transaction.\n    pub fn cancel(&self)',
-              '    /// Request cancellation of the remote transaction.\n    #[allow(dead_code)]\n    pub fn cancel(&self)',
-          )
-          text = text.replace(
-              '    pub async fn request_buffered(',
-              '    #[allow(dead_code)]\n    pub async fn request_buffered(',
-              1,
-          )
-          text = text.replace(
-              '        } else if let Some(route) = existing {\n            if let Err(error) = self.release_route(&route).await {\n                tracing::warn!(%error, "failed to release replaced imported route");\n            }\n        }',
-              '        } else if let Some(route) = existing\n            && let Err(error) = self.release_route(&route).await\n        {\n            tracing::warn!(%error, "failed to release replaced imported route");\n        }',
-          )
-          runtime.write_text(text)
-
-          main = Path('apps/veilid-http-native/src/main.rs')
-          text = main.read_text()
-          text = text.replace(
-              '#[derive(Debug, Deserialize)]\n#[serde(tag = "type", rename_all = "camelCase")]\nenum Request',
-              '#[allow(clippy::enum_variant_names)]\n#[derive(Debug, Deserialize)]\n#[serde(tag = "type", rename_all = "camelCase")]\nenum Request',
-          )
-          text = text.replace(
-              '.unwrap_or_else(|_| u64::MAX);',
-              '.unwrap_or(u64::MAX);',
-          )
-          main.write_text(text)
-          PY
-          cargo fmt --all
-      - name: Commit lint fixes
-        run: |
-          if git diff --quiet; then
-            echo 'No lint fixes were needed.'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add apps/veilid-http-native/src/main.rs apps/veilid-http-native/src/runtime.rs
-          git commit -m 'Address native sidecar Clippy findings'
-          git push origin HEAD:agent/initial-veilid-http
+      - run: echo 'The one-time lint maintenance pass has completed.'
