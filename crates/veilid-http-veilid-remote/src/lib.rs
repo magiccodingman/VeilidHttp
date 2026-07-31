@@ -213,7 +213,7 @@ impl RemoteVeilidTransport {
         };
 
         if let ResponseOp::Attach { result } = client.request(RequestOp::Attach).await? {
-            if let Err(error) = unwrap_api_result(result) {
+            if let Err(error) = unwrap_api_result!(result) {
                 if !error.to_string().to_ascii_lowercase().contains("already") {
                     return Err(error);
                 }
@@ -225,7 +225,7 @@ impl RemoteVeilidTransport {
         }
 
         client.routing_context_id = match client.request(RequestOp::NewRoutingContext).await? {
-            ResponseOp::NewRoutingContext { result } => unwrap_api_result(result)?,
+            ResponseOp::NewRoutingContext { result } => unwrap_api_result!(result)?,
             _ => {
                 return Err(TransportError::Fatal(
                     "unexpected routing-context response".to_owned(),
@@ -329,18 +329,22 @@ fn parse_route(target: &RouteTarget) -> Result<RouteId, TransportError> {
         .map_err(|error| TransportError::InvalidTarget(error.to_string()))
 }
 
-fn unwrap_api_result<T>(result: ApiResult<T>) -> Result<T, TransportError> {
-    match result {
-        ApiResult::Ok { value } => Ok(value),
-        ApiResult::Err { error } => Err(classify_error(error)),
-    }
+macro_rules! unwrap_api_result {
+    ($result:expr) => {
+        match $result {
+            ApiResult::Ok { value } => Ok(value),
+            ApiResult::Err { error } => Err(classify_error(error)),
+        }
+    };
 }
 
-fn unwrap_string_result<T>(result: ApiResultWithString<T>) -> Result<String, TransportError> {
-    match result {
-        ApiResultWithString::Ok { value } => Ok(value),
-        ApiResultWithString::Err { error } => Err(classify_error(error)),
-    }
+macro_rules! unwrap_string_result {
+    ($result:expr) => {
+        match $result {
+            ApiResultWithString::Ok { value } => Ok(value),
+            ApiResultWithString::Err { error } => Err(classify_error(error)),
+        }
+    };
 }
 
 fn unwrap_vec_result(result: ApiResultWithVecU8) -> Result<Vec<u8>, TransportError> {
@@ -375,9 +379,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             })
             .await?
         {
-            ResponseOp::ImportRemotePrivateRoute { result } => {
-                Ok(RouteTarget(unwrap_string_result(result)?))
-            }
+            ResponseOp::ImportRemotePrivateRoute { result } => Ok(RouteTarget(
+                unwrap_string_result!(result)?.to_string(),
+            )),
             _ => Err(TransportError::Fatal(
                 "unexpected import-route response".to_owned(),
             )),
@@ -387,7 +391,7 @@ impl VeilidTransport for RemoteVeilidTransport {
     async fn allocate_route(&self) -> Result<(RouteTarget, Bytes), TransportError> {
         match self.request(RequestOp::NewPrivateRoute).await? {
             ResponseOp::NewPrivateRoute { result } => {
-                let route = unwrap_api_result(result)?;
+                let route = unwrap_api_result!(result)?;
                 Ok((
                     RouteTarget(route.route_id.to_string()),
                     Bytes::from(route.blob),
@@ -406,7 +410,7 @@ impl VeilidTransport for RemoteVeilidTransport {
             })
             .await?
         {
-            ResponseOp::ReleasePrivateRoute { result } => unwrap_api_result(result),
+            ResponseOp::ReleasePrivateRoute { result } => unwrap_api_result!(result),
             _ => Err(TransportError::Fatal(
                 "unexpected release-route response".to_owned(),
             )),
@@ -446,7 +450,7 @@ impl VeilidTransport for RemoteVeilidTransport {
             })
             .await?
         {
-            RoutingContextResponseOp::AppMessage { result } => unwrap_api_result(result),
+            RoutingContextResponseOp::AppMessage { result } => unwrap_api_result!(result),
             _ => Err(TransportError::Fatal(
                 "unexpected AppMessage response".to_owned(),
             )),
@@ -469,7 +473,7 @@ impl VeilidTransport for RemoteVeilidTransport {
             })
             .await?
         {
-            ResponseOp::AppCallReply { result } => unwrap_api_result(result),
+            ResponseOp::AppCallReply { result } => unwrap_api_result!(result),
             _ => Err(TransportError::Fatal(
                 "unexpected AppCall reply response".to_owned(),
             )),
