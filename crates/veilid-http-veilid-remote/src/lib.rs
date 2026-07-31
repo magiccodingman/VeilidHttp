@@ -18,7 +18,7 @@ use tokio::{
     net::TcpStream,
     sync::{Mutex, mpsc, oneshot},
 };
-use veilid_core::{OperationId, RouteId, VeilidAPIError, VeilidUpdate};
+use veilid_core::{OperationId, RouteId, Target, VeilidAPIError, VeilidUpdate};
 use veilid_http_transport::{RouteTarget, TransportError, TransportEvent, VeilidTransport};
 use veilid_remote_api::{
     ApiResult, ApiResultWithString, ApiResultWithVecU8, RecvMessage, Request, RequestOp,
@@ -420,7 +420,7 @@ impl VeilidTransport for RemoteVeilidTransport {
     ) -> Result<Bytes, TransportError> {
         match self
             .routing_request(RoutingContextRequestOp::AppCall {
-                target: parse_route(target)?.into(),
+                target: Target::PrivateRoute(parse_route(target)?),
                 message: payload.to_vec(),
             })
             .await?
@@ -441,7 +441,7 @@ impl VeilidTransport for RemoteVeilidTransport {
     ) -> Result<(), TransportError> {
         match self
             .routing_request(RoutingContextRequestOp::AppMessage {
-                target: parse_route(target)?.into(),
+                target: Target::PrivateRoute(parse_route(target)?),
                 message: payload.to_vec(),
             })
             .await?
