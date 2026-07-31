@@ -53,7 +53,7 @@ jobs:
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
       - name: Verify service workers, storage, CORS, and streams on veilid://
-        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron test/electron-pwa-smoke.cjs
+        run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
 
   compose:
