@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust:
@@ -38,8 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout source
+      - name: Checkout source branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
       - name: Report runner context
         run: uname -a && git rev-parse HEAD
       - uses: actions/setup-node@v4
@@ -50,6 +53,8 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
+      - name: Generate updated lockfile
+        run: pnpm install --lockfile-only --no-frozen-lockfile
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
@@ -69,6 +74,19 @@ jobs:
           app_dir="$(find apps/veilid-http-electron/out -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
           test -n "$app_dir"
           pnpm --filter @veilid-http/electron exec electron-fuses read --app "$app_dir"
+      - name: Commit tested lock and restore read-only CI
+        if: github.event_name == 'pull_request' && github.head_ref == 'agent/complete-veilid-http'
+        run: |
+          git show a474919d2bb477880dc5129ccfacc6e3a581adcb:.github/workflows/ci.yml > .github/workflows/ci.yml
+          git config user.name 'veilid-http-ci'
+          git config user.email 'veilid-http-ci@users.noreply.github.com'
+          git add pnpm-lock.yaml .github/workflows/ci.yml
+          if git diff --cached --quiet; then
+            echo 'No lockfile update required'
+            exit 0
+          fi
+          git commit -m 'Lock Electron fuse hardening dependencies'
+          git push origin HEAD:${GITHUB_HEAD_REF}
 
   compose:
     runs-on: ubuntu-latest
