@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::sync::{Mutex, mpsc};
 use veilid_core::{
-    OperationId, RouteId, RoutingContext, UpdateCallback, VeilidAPI, VeilidAPIError, VeilidConfig,
-    VeilidUpdate, api_startup_json,
+    OperationId, RouteId, RoutingContext, Target, UpdateCallback, VeilidAPI, VeilidAPIError,
+    VeilidConfig, VeilidUpdate, api_startup_json,
 };
 use veilid_http_transport::{RouteTarget, TransportError, TransportEvent, VeilidTransport};
 
@@ -175,6 +175,10 @@ fn parse_route(target: &RouteTarget) -> Result<RouteId, TransportError> {
         .map_err(|error| TransportError::InvalidTarget(error.to_string()))
 }
 
+fn private_target(target: &RouteTarget) -> Result<Target, TransportError> {
+    Ok(Target::PrivateRoute(parse_route(target)?))
+}
+
 fn classify_error(error: VeilidAPIError) -> TransportError {
     let message = error.to_string();
     let normalized = message.to_ascii_lowercase();
@@ -221,7 +225,7 @@ impl VeilidTransport for NativeVeilidTransport {
         payload: Bytes,
     ) -> Result<Bytes, TransportError> {
         self.routing
-            .app_call(parse_route(target)?.into(), payload.to_vec())
+            .app_call(private_target(target)?, payload.to_vec())
             .await
             .map(Bytes::from)
             .map_err(classify_error)
@@ -233,7 +237,7 @@ impl VeilidTransport for NativeVeilidTransport {
         payload: Bytes,
     ) -> Result<(), TransportError> {
         self.routing
-            .app_message(parse_route(target)?.into(), payload.to_vec())
+            .app_message(private_target(target)?, payload.to_vec())
             .await
             .map_err(classify_error)
     }
