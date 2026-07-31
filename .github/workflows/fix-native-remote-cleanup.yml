@@ -1,6 +1,7 @@
 name: Fix native and remote Rust cleanup
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - agent/complete-veilid-http
