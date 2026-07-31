@@ -46,6 +46,9 @@ pub enum HttpTranslationError {
     /// CONNECT would create a raw tunnel, which is outside VHTTP/1.
     #[error("HTTP CONNECT is not supported by VHTTP/1")]
     ConnectUnsupported,
+    /// An HTTP protocol upgrade would escape the request/response translation contract.
+    #[error("HTTP protocol upgrades are not supported by VHTTP/1")]
+    UpgradeUnsupported,
     /// Upstream base URL is invalid.
     #[error("invalid upstream URL")]
     InvalidUpstream,
@@ -61,8 +64,22 @@ pub fn normalize_request(mut request: RequestHead) -> Result<RequestHead, HttpTr
     if !request.path_and_query.starts_with('/') || request.path_and_query.starts_with("//") {
         return Err(HttpTranslationError::AbsoluteUriForbidden);
     }
+    if requests_upgrade(&request.headers) {
+        return Err(HttpTranslationError::UpgradeUnsupported);
+    }
     request.headers = strip_hop_by_hop(request.headers);
     Ok(request)
+}
+
+fn requests_upgrade(headers: &[HeaderField]) -> bool {
+    headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("upgrade")
+            || (header.name.eq_ignore_ascii_case("connection")
+                && header
+                    .value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+    })
 }
 
 /// Remove RFC hop-by-hop fields and tokens named by `Connection`.
@@ -141,6 +158,21 @@ mod tests {
         }
         let connect = RequestHead { method: "CONNECT".into(), path_and_query: "/".into(), headers: Vec::new() };
         assert_eq!(normalize_request(connect), Err(HttpTranslationError::ConnectUnsupported));
+    }
+
+    #[test]
+    fn rejects_websocket_and_other_protocol_upgrades() {
+        for headers in [
+            vec![HeaderField { name: "Upgrade".into(), value: "websocket".into() }],
+            vec![HeaderField { name: "Connection".into(), value: "keep-alive, Upgrade".into() }],
+        ] {
+            let request = RequestHead {
+                method: "GET".into(),
+                path_and_query: "/socket".into(),
+                headers,
+            };
+            assert_eq!(normalize_request(request), Err(HttpTranslationError::UpgradeUnsupported));
+        }
     }
 
     #[test]
