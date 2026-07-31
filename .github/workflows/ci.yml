@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, agent/initial-veilid-http]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,51 +14,6 @@ permissions:
   contents: read
 
 jobs:
-  maintain-draft:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.actor != 'github-actions[bot]' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout trusted PR branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.89.0
-          components: rustfmt
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.13.1
-          run_install: false
-      - name: Format Rust and generate lockfiles
-        run: |
-          cargo fmt --all
-          cargo generate-lockfile
-          pnpm install --lockfile-only
-      - name: Commit maintenance output
-        run: |
-          if git diff --quiet -- Cargo.lock pnpm-lock.yaml '*.rs'; then
-            echo 'Workspace already formatted and locked.'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.lock pnpm-lock.yaml
-          git add -- '*.rs'
-          git commit -m 'Apply rustfmt and commit lockfiles'
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
-
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -76,13 +31,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
-      - name: Preserve generated Cargo lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lock
-          path: Cargo.lock
-          if-no-files-found: ignore
 
   electron:
     runs-on: ubuntu-latest
@@ -100,20 +48,13 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
       - name: Verify service workers, storage, CORS, and streams on veilid://
         run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron test/electron-pwa-smoke.cjs
         timeout-minutes: 2
-      - name: Preserve generated pnpm lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pnpm-lock
-          path: pnpm-lock.yaml
-          if-no-files-found: ignore
 
   compose:
     runs-on: ubuntu-latest
