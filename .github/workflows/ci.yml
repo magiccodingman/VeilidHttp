@@ -50,13 +50,6 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
-      - name: Generate updated lockfile
-        run: pnpm install --lockfile-only --no-frozen-lockfile
-      - name: Upload generated lockfile
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-pnpm-lock
-          path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
@@ -64,6 +57,18 @@ jobs:
       - name: Verify service workers, storage, CORS, and streams on localhost origins
         run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
+      - name: Prepare packaged transport fixture
+        run: |
+          mkdir -p target/release
+          printf '#!/bin/sh\nexit 1\n' > target/release/veilid-http-native
+          chmod +x target/release/veilid-http-native
+      - name: Package hardened Electron client
+        run: pnpm --filter @veilid-http/electron package -- --platform=linux --arch=x64
+      - name: Report packaged Electron fuses
+        run: |
+          app_dir="$(find apps/veilid-http-electron/out -mindepth 1 -maxdepth 1 -type d -name '*-linux-*' -print -quit)"
+          test -n "$app_dir"
+          pnpm --filter @veilid-http/electron exec electron-fuses read --app "$app_dir"
 
   compose:
     runs-on: ubuntu-latest
