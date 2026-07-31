@@ -6,6 +6,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -140,16 +141,15 @@ impl CompletionStore {
                             expires_at_unix_seconds: expires_at,
                         },
                     );
-                    if in_flight {
-                        if let Err(error) =
+                    if in_flight
+                        && let Err(error) =
                             persist_entry(&directory, id, response.as_ref(), expires_at, false)
-                        {
-                            tracing::warn!(
-                                %error,
-                                path = %path.display(),
-                                "could not normalize recovered in-flight claim to tombstone"
-                            );
-                        }
+                    {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "could not normalize recovered in-flight claim to tombstone"
+                        );
                     }
                 }
                 Ok(_) => {
@@ -447,7 +447,11 @@ fn now_unix_seconds() -> Result<u64> {
 }
 
 fn hex_transaction(id: [u8; 16]) -> String {
-    id.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut encoded = String::with_capacity(32);
+    for byte in id {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 fn parse_hex_transaction(value: &str) -> Result<[u8; 16]> {
