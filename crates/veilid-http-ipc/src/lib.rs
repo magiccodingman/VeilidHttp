@@ -222,10 +222,18 @@ pub enum IpcStreamDirection {
     Response,
 }
 
+const fn default_credit_direction() -> IpcStreamDirection {
+    IpcStreamDirection::Response
+}
+
 /// Per-request stream delivery credit update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCredit {
     /// Logical body direction whose capacity is being increased.
+    ///
+    /// Older Electron clients omitted this field; those client-to-sidecar credits are
+    /// response-window grants, so deserialization defaults them safely to `Response`.
+    #[serde(default = "default_credit_direction")]
     pub direction: IpcStreamDirection,
     /// Additional body chunks the receiver is ready to accept.
     pub credits: u32,
@@ -324,6 +332,18 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(received, expected);
         assert_eq!(received.decode_metadata::<StreamCredit>().unwrap(), credit);
+    }
+
+    #[test]
+    fn missing_credit_direction_defaults_to_response() {
+        #[derive(Serialize)]
+        struct LegacyCredit {
+            credits: u32,
+        }
+        let encoded = rmp_serde::to_vec_named(&LegacyCredit { credits: 3 }).unwrap();
+        let decoded: StreamCredit = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.direction, IpcStreamDirection::Response);
+        assert_eq!(decoded.credits, 3);
     }
 
     #[test]
