@@ -27,6 +27,24 @@ use veilid_remote_api::{
 
 const MAX_REMOTE_LINE_BYTES: usize = 40 * 1024 * 1024;
 
+macro_rules! unwrap_api_result {
+    ($result:expr) => {
+        match $result {
+            ApiResult::Ok { value } => Ok(value),
+            ApiResult::Err { error } => Err(classify_error(error)),
+        }
+    };
+}
+
+macro_rules! unwrap_string_result {
+    ($result:expr) => {
+        match $result {
+            ApiResultWithString::Ok { value } => Ok(value),
+            ApiResultWithString::Err { error } => Err(classify_error(error)),
+        }
+    };
+}
+
 /// Address of the internal `veilid-server` client API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteEndpoint {
@@ -327,24 +345,6 @@ async fn map_update(
 fn parse_route(target: &RouteTarget) -> Result<RouteId, TransportError> {
     RouteId::try_from(target.0.as_str())
         .map_err(|error| TransportError::InvalidTarget(error.to_string()))
-}
-
-macro_rules! unwrap_api_result {
-    ($result:expr) => {
-        match $result {
-            ApiResult::Ok { value } => Ok(value),
-            ApiResult::Err { error } => Err(classify_error(error)),
-        }
-    };
-}
-
-macro_rules! unwrap_string_result {
-    ($result:expr) => {
-        match $result {
-            ApiResultWithString::Ok { value } => Ok(value),
-            ApiResultWithString::Err { error } => Err(classify_error(error)),
-        }
-    };
 }
 
 fn unwrap_vec_result(result: ApiResultWithVecU8) -> Result<Vec<u8>, TransportError> {
