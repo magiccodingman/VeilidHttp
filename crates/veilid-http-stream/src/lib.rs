@@ -928,13 +928,13 @@ mod tests {
     fn corrupted_end_digest_is_rejected() {
         let mut encoder =
             StreamEncoder::new(StreamDirection::Request, CompressionMode::None, 0).unwrap();
-        let encoded = encoder.push(b"hello", false).unwrap();
+        let compressed = encoder.push(b"hello", false).unwrap();
         let (_, mut end) = encoder.finish().unwrap();
         end.blake3[0] ^= 1;
         let mut decoder =
             StreamDecoder::new(StreamDirection::Request, CompressionMode::None, 10).unwrap();
         assert_eq!(
-            decoder.push(&encoded, false).unwrap(),
+            decoder.push(&compressed, false).unwrap(),
             Bytes::from_static(b"hello")
         );
         assert!(matches!(
