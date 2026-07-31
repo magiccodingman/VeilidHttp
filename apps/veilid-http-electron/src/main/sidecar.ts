@@ -205,6 +205,7 @@ export class Sidecar {
           ...fields,
           hasBody: requestBody !== null,
         }, Buffer.alloc(0));
+        this.grantResponseCredits(requestId);
       } catch (error) {
         this.failStream(requestId, toError(error), false);
       }
