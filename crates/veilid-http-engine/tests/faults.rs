@@ -1,3 +1,5 @@
+//! Fault-injection coverage for VHTTP body ordering, retry, deduplication, and windows.
+
 use bytes::Bytes;
 use veilid_http_core::RetryPolicy;
 use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
@@ -107,21 +109,20 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         let mut sent = sender.take_sendable(now, policy);
         sent.reverse();
         for retained in sent {
-            let sequence = match decode(retained.encoded.clone()).unwrap() {
-                DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. } => {
-                    sequence
-                }
-                _ => unreachable!(),
+            let (DecodedFrame::Data { sequence, .. }
+            | DecodedFrame::End { sequence, .. }) = decode(retained.encoded.clone()).unwrap()
+            else {
+                unreachable!();
             };
             if sequence == 1 && !dropped_one {
                 dropped_one = true;
                 continue;
             }
-            let received = receiver.receive(retained.encoded).unwrap();
-            for chunk in received.logical_chunks {
+            let stream_output = receiver.receive(retained.encoded).unwrap();
+            for chunk in stream_output.logical_chunks {
                 output.extend_from_slice(&chunk);
             }
-            sender.acknowledge(received.ack).unwrap();
+            sender.acknowledge(stream_output.ack).unwrap();
         }
         assert!(sender.in_flight_frames() <= 8);
         if sender.is_complete() && receiver.is_complete() {
