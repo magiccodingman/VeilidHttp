@@ -5,7 +5,7 @@ mod runtime;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
-use runtime::{ClientResponseEvent, ClientRuntime};
+use runtime::{ClientRequest, ClientResponseEvent, ClientRuntime};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -225,6 +225,31 @@ async fn queue_response<T: Serialize>(
         .context("queue IPC response")
 }
 
+async fn forward_request_credits(
+    outbound: mpsc::Sender<IpcFrame>,
+    request_id: u64,
+    mut credits: mpsc::Receiver<u32>,
+) {
+    while let Some(credits) = credits.recv().await {
+        if credits == 0 || credits > MAX_STREAM_CREDITS {
+            tracing::error!(request_id, credits, "native runtime produced invalid upload credits");
+            break;
+        }
+        if let Err(error) = queue_response(
+            &outbound,
+            FrameKind::StreamCredit,
+            request_id,
+            &StreamCredit { credits },
+            Bytes::new(),
+        )
+        .await
+        {
+            tracing::debug!(%error, request_id, "stopped forwarding request-body credits");
+            break;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_http_request(
     state: Arc<State>,
@@ -260,8 +285,13 @@ async fn start_http_request(
         has_body,
     );
     let cancel = request.cancellation_handle();
-    let request_body = request.request_body;
-    let mut responses = request.responses;
+    let ClientRequest {
+        request_body,
+        request_credits,
+        initial_request_credits,
+        mut responses,
+        ..
+    } = request;
     let response_credits = Arc::new(Semaphore::new(0));
     active.lock().await.insert(
         request_id,
@@ -272,6 +302,29 @@ async fn start_http_request(
             _permit: permit,
         },
     );
+
+    if initial_request_credits > 0 {
+        if initial_request_credits > MAX_STREAM_CREDITS {
+            if let Some(request) = active.lock().await.remove(&request_id) {
+                request.response_credits.close();
+                let _ = request.cancel.send(true);
+            }
+            bail!("native runtime returned an invalid initial upload credit window");
+        }
+        queue_response(
+            &outbound,
+            FrameKind::StreamCredit,
+            request_id,
+            &StreamCredit {
+                credits: initial_request_credits,
+            },
+            Bytes::new(),
+        )
+        .await?;
+    }
+    if let Some(credits) = request_credits {
+        tokio::spawn(forward_request_credits(outbound.clone(), request_id, credits));
+    }
 
     tokio::spawn(async move {
         let mut head_sent = false;
@@ -496,12 +549,16 @@ where
                     .and_then(|request| request.request_body.clone());
                 match sender {
                     Some(sender) => {
-                        if sender.send(frame.payload).await.is_err() {
+                        if sender.try_send(frame.payload).is_err() {
+                            if let Some(request) = active.lock().await.remove(&frame.request_id) {
+                                request.response_credits.close();
+                                let _ = request.cancel.send(true);
+                            }
                             queue_response(
                                 &outbound,
                                 FrameKind::Cancel,
                                 frame.request_id,
-                                &failure("native request-body stream is closed"),
+                                &failure("request-body producer exceeded its granted IPC credits"),
                                 Bytes::new(),
                             )
                             .await?;
@@ -576,7 +633,9 @@ where
                     .map_err(|_| anyhow::anyhow!("stream credit count does not fit usize"))?;
                 let maximum = usize::try_from(MAX_STREAM_CREDITS)
                     .map_err(|_| anyhow::anyhow!("stream credit bound does not fit usize"))?;
-                if response_credits.available_permits().saturating_add(credits) > maximum {
+                if response_credits.is_closed()
+                    || response_credits.available_permits().saturating_add(credits) > maximum
+                {
                     response_credits.close();
                     queue_response(
                         &outbound,
