@@ -21,12 +21,22 @@ const STREAM_CREDIT = 8;
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
 const INITIAL_RESPONSE_CREDITS = 4;
-const MAX_RESPONSE_CREDITS = 64;
+const MAX_STREAM_CREDITS = 64;
 
 type ResponseEnvelope<T> = {
   ok: boolean;
   result?: T;
   error?: string;
+};
+
+type StreamCreditEnvelope = {
+  direction: 'request' | 'response';
+  credits: number;
+};
+
+type CreditWaiter = {
+  resolve(): void;
+  reject(error: Error): void;
 };
 
 type UnaryPending = {
@@ -41,6 +51,8 @@ type StreamPending = {
   rejectHead(error: Error): void;
   controller: ReadableStreamDefaultController<Uint8Array>;
   headResolved: boolean;
+  requestCredits: number;
+  requestCreditWaiters: CreditWaiter[];
   responseCredits: number;
   cleanup(): void;
 };
@@ -186,6 +198,8 @@ export class Sidecar {
         rejectHead: reject,
         controller,
         headResolved: false,
+        requestCredits: 0,
+        requestCreditWaiters: [],
         responseCredits: 0,
         cleanup,
       });
@@ -233,6 +247,7 @@ export class Sidecar {
         const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
         for (let offset = 0; offset < bytes.length; offset += MAX_PAYLOAD_BYTES) {
           const end = Math.min(offset + MAX_PAYLOAD_BYTES, bytes.length);
+          await this.takeRequestCredit(requestId);
           await this.writeFrameAsync(STREAM_DATA, requestId, {}, bytes.subarray(offset, end));
         }
       }
@@ -242,18 +257,52 @@ export class Sidecar {
     }
   }
 
+  private takeRequestCredit(requestId: bigint): Promise<void> {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.kind !== 'stream') {
+      return Promise.reject(new Error('request stream is no longer active'));
+    }
+    if (pending.requestCredits > 0) {
+      pending.requestCredits -= 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      pending.requestCreditWaiters.push({ resolve, reject });
+    });
+  }
+
+  private addRequestCredits(requestId: bigint, credits: number): void {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.kind !== 'stream') return;
+    if (!Number.isInteger(credits) || credits <= 0 || credits > MAX_STREAM_CREDITS) {
+      this.failStream(requestId, new Error('invalid request-stream credit update'), true);
+      return;
+    }
+    let remaining = credits;
+    while (remaining > 0 && pending.requestCreditWaiters.length > 0) {
+      pending.requestCreditWaiters.shift()!.resolve();
+      remaining -= 1;
+    }
+    if (remaining > 0) {
+      pending.requestCredits = Math.min(MAX_STREAM_CREDITS, pending.requestCredits + remaining);
+    }
+  }
+
   private grantResponseCredits(requestId: bigint): void {
     const pending = this.pending.get(requestId);
     if (!pending || pending.kind !== 'stream') return;
     const desired = Math.max(0, Math.min(
-      MAX_RESPONSE_CREDITS,
+      MAX_STREAM_CREDITS,
       Math.floor(pending.controller.desiredSize ?? 0),
     ));
     const credits = desired - pending.responseCredits;
     if (credits <= 0) return;
     pending.responseCredits += credits;
     try {
-      this.writeFrame(STREAM_CREDIT, requestId, { credits }, Buffer.alloc(0));
+      this.writeFrame(STREAM_CREDIT, requestId, {
+        direction: 'response',
+        credits,
+      }, Buffer.alloc(0));
     } catch (error) {
       pending.responseCredits -= credits;
       this.failStream(requestId, toError(error), false);
@@ -312,7 +361,7 @@ export class Sidecar {
       const requestId = this.receiveBuffer.readBigUInt64BE(8);
       const metadataLength = this.receiveBuffer.readUInt32BE(16);
       const payloadLength = this.receiveBuffer.readUInt32BE(20);
-      if (version !== VERSION || ![RESPONSE, STREAM_DATA, STREAM_END, CANCEL, EVENT].includes(kind)) {
+      if (version !== VERSION || ![RESPONSE, STREAM_DATA, STREAM_END, CANCEL, EVENT, STREAM_CREDIT].includes(kind)) {
         this.failAll(new Error('Unsupported VeilidHttp IPC response'));
         return;
       }
@@ -328,6 +377,21 @@ export class Sidecar {
 
       const pending = this.pending.get(requestId);
       if (!pending) continue;
+      if (kind === STREAM_CREDIT) {
+        let credit: StreamCreditEnvelope;
+        try {
+          credit = decode(metadataBytes) as StreamCreditEnvelope;
+        } catch (error) {
+          this.failStream(requestId, toError(error), true);
+          continue;
+        }
+        if (credit.direction !== 'request') {
+          this.failStream(requestId, new Error('unexpected response-direction credit from sidecar'), true);
+          continue;
+        }
+        this.addRequestCredits(requestId, credit.credits);
+        continue;
+      }
       if (kind === STREAM_DATA) {
         if (pending.kind !== 'stream') {
           this.failAll(new Error('Received stream data for a unary IPC request'));
@@ -348,6 +412,7 @@ export class Sidecar {
         }
         pending.controller.close();
         pending.cleanup();
+        this.rejectCreditWaiters(pending, new Error('request stream already ended'));
         this.pending.delete(requestId);
         continue;
       }
@@ -390,6 +455,10 @@ export class Sidecar {
     }
   }
 
+  private rejectCreditWaiters(pending: StreamPending, error: Error): void {
+    for (const waiter of pending.requestCreditWaiters.splice(0)) waiter.reject(error);
+  }
+
   private cancelStream(requestId: bigint, reason: string): void {
     const pending = this.pending.get(requestId);
     if (!pending || pending.kind !== 'stream') return;
@@ -412,6 +481,7 @@ export class Sidecar {
       }
     }
     if (!pending.headResolved) pending.rejectHead(error);
+    this.rejectCreditWaiters(pending, error);
     try {
       pending.controller.error(error);
     } catch {
@@ -429,6 +499,7 @@ export class Sidecar {
         pending.reject(error);
       } else {
         if (!pending.headResolved) pending.rejectHead(error);
+        this.rejectCreditWaiters(pending, error);
         try {
           pending.controller.error(error);
         } catch {
