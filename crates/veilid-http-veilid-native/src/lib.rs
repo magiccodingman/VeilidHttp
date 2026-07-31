@@ -176,7 +176,7 @@ fn parse_route(target: &RouteTarget) -> Result<RouteId, TransportError> {
 }
 
 fn private_target(target: &RouteTarget) -> Result<Target, TransportError> {
-    Ok(Target::PrivateRoute(parse_route(target)?))
+    Ok(Target::RouteId(parse_route(target)?))
 }
 
 fn classify_error(error: VeilidAPIError) -> TransportError {
