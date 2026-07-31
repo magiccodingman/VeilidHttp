@@ -68,7 +68,8 @@ expose arbitrary TCP or UDP tunnels. WebSockets, SignalR, WebTransport, and HTTP
 
 Both Veilid 0.5.5 adapters construct explicit `Target::RouteId` destinations for
 AppCall/AppMessage traffic. A RouteId is never treated as a node target or left to an
-implicit conversion.
+implicit conversion. The remote adapter also decodes the pinned 0.5.5 result wrappers
+before converting imported route identifiers into local transport targets.
 
 ## Development
 
