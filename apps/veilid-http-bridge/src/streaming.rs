@@ -469,7 +469,8 @@ impl StreamingBridge {
         transaction: Arc<ServerTransaction>,
     ) -> Result<()> {
         let target = upstream_url(&self.config.upstream_url, &open.head.path_and_query)?;
-        let method = reqwest::Method::from_bytes(open.head.method.as_bytes())
+        let request_method = open.head.method.clone();
+        let method = reqwest::Method::from_bytes(request_method.as_bytes())
             .context("parse streamed HTTP method")?;
         let headers = attach_route_headers(
             open.head.headers,
@@ -514,13 +515,16 @@ impl StreamingBridge {
                 })
                 .collect::<Vec<_>>(),
         );
+        let response_has_body = !request_method.eq_ignore_ascii_case("HEAD")
+            && !(100..200).contains(&status)
+            && !matches!(status, 204 | 205 | 304);
         let response_open = ResponseOpen {
             head: ResponseHead {
                 status,
                 headers: response_headers,
             },
             response_compression: CompressionMode::Zstd,
-            response_body: true,
+            response_body: response_has_body,
             request_receive_window: self.config.window_frames,
         };
         self.transport
@@ -530,6 +534,9 @@ impl StreamingBridge {
             )
             .await
             .context("send streamed ResponseOpen")?;
+        if !response_has_body {
+            return Ok(());
+        }
 
         let mut outbound = OutboundBody::new(
             transaction_id,
@@ -610,16 +617,53 @@ impl StreamingBridge {
         transaction: &ServerTransaction,
         chunk: &[u8],
     ) -> Result<()> {
-        let mut sender = transaction.response_sender.lock().await;
-        let outbound = sender
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("response sender is not initialized"))?;
-        let limit = outbound.max_input_chunk();
+        let limit = transaction
+            .response_sender
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("response sender is not initialized"))?
+            .max_input_chunk();
         let count = chunk.chunks(limit).count();
         for (index, part) in chunk.chunks(limit).enumerate() {
-            outbound.push(part, index + 1 == count)?;
+            tokio::time::timeout(
+                self.config.overall_timeout,
+                self.wait_for_response_capacity(transaction),
+            )
+            .await
+            .context("response sender remained backpressured past the overall timeout")??;
+            transaction
+                .response_sender
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("response sender disappeared"))?
+                .push(part, index + 1 == count)?;
+            self.dispatch_ready(transaction).await?;
         }
         Ok(())
+    }
+
+    async fn wait_for_response_capacity(
+        &self,
+        transaction: &ServerTransaction,
+    ) -> Result<()> {
+        loop {
+            self.dispatch_ready(transaction).await?;
+            let backpressured = transaction
+                .response_sender
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(OutboundBody::is_backpressured);
+            if !backpressured {
+                return Ok(());
+            }
+            tokio::select! {
+                () = transaction.response_notify.notified() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
     }
 
     async fn dispatch_ready(&self, transaction: &ServerTransaction) -> Result<()> {

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, agent/finish-live-integration]
   pull_request:
   workflow_dispatch:
 
@@ -28,7 +28,23 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo metadata --no-deps --format-version 1 >/dev/null
-      - run: cargo fmt --all --check
+      - name: Check Rust formatting
+        id: rustfmt
+        shell: bash
+        run: |
+          if ! cargo fmt --all --check; then
+            cargo fmt --all
+            git diff --binary -- '*.rs' > rustfmt.patch
+            cat rustfmt.patch
+            exit 1
+          fi
+      - name: Preserve rustfmt patch
+        if: failure() && steps.rustfmt.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: ignore
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - name: Preserve generated Cargo lockfile
