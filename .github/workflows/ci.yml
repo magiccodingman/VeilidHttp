@@ -50,6 +50,13 @@ jobs:
           version: 10.13.1
           run_install: false
       - run: node -e "for (const p of ['package.json','apps/veilid-http-electron/package.json']) JSON.parse(require('node:fs').readFileSync(p, 'utf8'))"
+      - name: Generate updated lockfile
+        run: pnpm install --lockfile-only --no-frozen-lockfile
+      - name: Upload generated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-pnpm-lock
+          path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
