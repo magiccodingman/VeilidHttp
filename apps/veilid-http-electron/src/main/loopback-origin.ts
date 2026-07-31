@@ -1,9 +1,13 @@
+import crypto from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { isSiteId, ORIGIN_HOST_SUFFIX } from '../shared/site-id';
 import type { Sidecar } from './sidecar';
 
+export const LOOPBACK_AUTH_HEADER = 'x-veilid-http-client-secret';
+
+const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'keep-alive',
@@ -26,12 +30,28 @@ export function siteIdFromHost(hostHeader: string | undefined, port: number): st
   return isSiteId(siteId) ? siteId : undefined;
 }
 
+function hasValidClientSecret(
+  headerValue: string | string[] | undefined,
+  expectedSecret: string,
+): boolean {
+  const supplied = Array.isArray(headerValue)
+    ? (headerValue.length === 1 ? headerValue[0] : undefined)
+    : headerValue;
+  if (!supplied) return false;
+  const suppliedBytes = Buffer.from(supplied);
+  const expectedBytes = Buffer.from(expectedSecret);
+  return suppliedBytes.length === expectedBytes.length
+    && crypto.timingSafeEqual(suppliedBytes, expectedBytes);
+}
+
 function requestHeaders(request: IncomingMessage): Array<[string, string]> {
   const headers: Array<[string, string]> = [];
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
     const name = request.rawHeaders[index];
     const value = request.rawHeaders[index + 1];
-    if (name !== undefined && value !== undefined) headers.push([name, value]);
+    if (name === undefined || value === undefined) continue;
+    if (name.toLowerCase() === LOOPBACK_AUTH_HEADER) continue;
+    headers.push([name, value]);
   }
   return headers;
 }
@@ -52,20 +72,45 @@ function appendResponseHeaders(response: ServerResponse, headers: Array<[string,
   }
 }
 
+function reject(
+  response: ServerResponse,
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+): void {
+  response.writeHead(status, {
+    'content-type': 'text/plain; charset=utf-8',
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  response.end(message);
+}
+
 async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
   sidecar: Sidecar,
   port: number,
+  clientSecret: string,
 ): Promise<void> {
   const siteId = siteIdFromHost(request.headers.host, port);
   if (!siteId) {
-    response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
-    response.end('Invalid VeilidHttp loopback origin');
+    reject(response, 400, 'Invalid VeilidHttp loopback origin');
+    return;
+  }
+  if (!hasValidClientSecret(request.headers[LOOPBACK_AUTH_HEADER], clientSecret)) {
+    reject(response, 403, 'VeilidHttp loopback access denied');
     return;
   }
 
-  const method = request.method ?? 'GET';
+  const method = (request.method ?? 'GET').toUpperCase();
+  if (!ALLOWED_METHODS.has(method)) {
+    reject(response, 405, 'HTTP method is not supported by VeilidHttp', {
+      allow: [...ALLOWED_METHODS].join(', '),
+    });
+    return;
+  }
+
   const pathAndQuery = request.url?.startsWith('/') ? request.url : '/';
   const abort = new AbortController();
   request.once('aborted', () => abort.abort(new Error('browser request aborted')));
@@ -94,7 +139,7 @@ async function handleRequest(
   response.statusCode = upstream.result.status;
   appendResponseHeaders(response, upstream.result.headers);
 
-  if (method.toUpperCase() === 'HEAD') {
+  if (method === 'HEAD') {
     response.end();
     return;
   }
@@ -110,27 +155,35 @@ export class LoopbackOriginServer {
   public constructor(
     private readonly sidecar: Sidecar,
     public readonly port: number,
-  ) {}
+    private readonly clientSecret: string,
+  ) {
+    if (clientSecret.length < 32) {
+      throw new Error('VeilidHttp loopback client secret is too short');
+    }
+  }
 
   public async start(): Promise<void> {
     if (this.server) return;
     const server = http.createServer((request, response) => {
-      void handleRequest(request, response, this.sidecar, this.port).catch((error: unknown) => {
+      void handleRequest(
+        request,
+        response,
+        this.sidecar,
+        this.port,
+        this.clientSecret,
+      ).catch((error: unknown) => {
         if (response.headersSent) {
           response.destroy(error instanceof Error ? error : new Error(String(error)));
           return;
         }
-        response.writeHead(502, {
-          'content-type': 'text/plain; charset=utf-8',
-          'cache-control': 'no-store',
-        });
-        response.end(error instanceof Error ? error.message : String(error));
+        reject(response, 502, error instanceof Error ? error.message : String(error));
       });
     });
+    server.on('upgrade', (_request, socket) => socket.destroy());
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 70_000;
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => reject(error);
+    await new Promise<void>((resolve, rejectStart) => {
+      const onError = (error: Error): void => rejectStart(error);
       server.once('error', onError);
       server.listen(this.port, '127.0.0.1', () => {
         server.off('error', onError);
@@ -144,8 +197,8 @@ export class LoopbackOriginServer {
     const server = this.server;
     this.server = undefined;
     if (!server) return;
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
+    await new Promise<void>((resolve, rejectStop) => {
+      server.close((error) => error ? rejectStop(error) : resolve());
     });
   }
 }
