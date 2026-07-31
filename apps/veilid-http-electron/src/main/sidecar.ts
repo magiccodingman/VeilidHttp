@@ -30,6 +30,7 @@ type ResponseEnvelope<T> = {
 };
 
 type StreamCreditEnvelope = {
+  direction: 'request' | 'response';
   credits: number;
 };
 
@@ -283,7 +284,11 @@ export class Sidecar {
       remaining -= 1;
     }
     if (remaining > 0) {
-      pending.requestCredits = Math.min(MAX_STREAM_CREDITS, pending.requestCredits + remaining);
+      if (pending.requestCredits + remaining > MAX_STREAM_CREDITS) {
+        this.failStream(requestId, new Error('request-stream credit window exceeded'), true);
+        return;
+      }
+      pending.requestCredits += remaining;
     }
   }
 
@@ -298,7 +303,7 @@ export class Sidecar {
     if (credits <= 0) return;
     pending.responseCredits += credits;
     try {
-      this.writeFrame(STREAM_CREDIT, requestId, { credits }, Buffer.alloc(0));
+      this.writeFrame(STREAM_CREDIT, requestId, { direction: 'response', credits }, Buffer.alloc(0));
     } catch (error) {
       pending.responseCredits -= credits;
       this.failStream(requestId, toError(error), false);
@@ -379,6 +384,10 @@ export class Sidecar {
           credit = decode(metadataBytes) as StreamCreditEnvelope;
         } catch (error) {
           this.failStream(requestId, toError(error), true);
+          continue;
+        }
+        if (credit.direction !== 'request') {
+          this.failStream(requestId, new Error('sidecar sent response-direction credits to the request stream'), true);
           continue;
         }
         this.addRequestCredits(requestId, credit.credits);
