@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_stream::{CompressionMode, DecodedFrame, StreamDirection, decode};
 
 #[test]
@@ -9,12 +9,14 @@ fn end_waits_for_missing_data_and_duplicates_deliver_once() {
     let mut sender = OutboundBody::new(
         transaction,
         StreamDirection::Response,
-        CompressionMode::None,
-        0,
-        1024,
-        128,
-        8,
-        64 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::None,
+            zstd_level: 0,
+            frame_limit: 1024,
+            reserved_metadata: 128,
+            window_frames: 8,
+            max_pending_bytes: 64 * 1024,
+        },
     )
     .unwrap();
     sender.push(b"alpha", true).unwrap();
@@ -69,12 +71,14 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
     let mut sender = OutboundBody::new(
         transaction,
         StreamDirection::Request,
-        CompressionMode::Zstd,
-        3,
-        2048,
-        256,
-        8,
-        1024 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::Zstd,
+            zstd_level: 3,
+            frame_limit: 2048,
+            reserved_metadata: 256,
+            window_frames: 8,
+            max_pending_bytes: 1024 * 1024,
+        },
     )
     .unwrap();
     let input_chunk = sender.max_input_chunk();
@@ -137,12 +141,14 @@ fn peer_zero_window_stops_new_frames_and_reopens_cleanly() {
     let mut sender = OutboundBody::new(
         [1; 16],
         StreamDirection::Response,
-        CompressionMode::None,
-        0,
-        1024,
-        128,
-        4,
-        16 * 1024,
+        OutboundBodyConfig {
+            compression: CompressionMode::None,
+            zstd_level: 0,
+            frame_limit: 1024,
+            reserved_metadata: 128,
+            window_frames: 4,
+            max_pending_bytes: 16 * 1024,
+        },
     )
     .unwrap();
     sender.set_peer_window(0).unwrap();

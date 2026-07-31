@@ -14,7 +14,7 @@ use tokio::{
     task::JoinHandle,
 };
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_http::{
     HeaderField, ResponseHead, attach_route_headers, normalize_request, strip_hop_by_hop,
     upstream_url,
@@ -551,12 +551,14 @@ impl StreamingBridge {
         let mut outbound = OutboundBody::new(
             transaction_id,
             StreamDirection::Response,
-            CompressionMode::Zstd,
-            3,
-            self.config.frame_bytes,
-            256,
-            usize::try_from(self.config.window_frames).unwrap_or(32),
-            self.config.max_pending_bytes,
+            OutboundBodyConfig {
+                compression: CompressionMode::Zstd,
+                zstd_level: 3,
+                frame_limit: self.config.frame_bytes,
+                reserved_metadata: 256,
+                window_frames: usize::try_from(self.config.window_frames).unwrap_or(32),
+                max_pending_bytes: self.config.max_pending_bytes,
+            },
         )?;
         outbound.set_peer_window(open.response_receive_window)?;
         *transaction.response_sender.lock().await = Some(outbound);

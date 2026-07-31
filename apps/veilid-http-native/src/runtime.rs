@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use veilid_http_core::RetryPolicy;
-use veilid_http_engine::{InboundBody, OutboundBody};
+use veilid_http_engine::{InboundBody, OutboundBody, OutboundBodyConfig};
 use veilid_http_http::{RequestHead, ResponseHead};
 use veilid_http_stream::{
     CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode, encode_ack,
@@ -378,12 +378,14 @@ impl ClientRuntime {
             let mut sender = OutboundBody::new(
                 transaction_id,
                 StreamDirection::Request,
-                CompressionMode::Zstd,
-                3,
-                self.frame_bytes,
-                256,
-                self.window_frames,
-                self.max_pending_bytes,
+                OutboundBodyConfig {
+                    compression: CompressionMode::Zstd,
+                    zstd_level: 3,
+                    frame_limit: self.frame_bytes,
+                    reserved_metadata: 256,
+                    window_frames: self.window_frames,
+                    max_pending_bytes: self.max_pending_bytes,
+                },
             )?;
             sender.set_peer_window(request_receive_window)?;
             Some(sender)
