@@ -6,8 +6,10 @@ import {
   WebContentsView,
   type Session,
 } from 'electron';
-import { Sidecar } from './sidecar';
+import type { Server } from 'node:http';
 import path from 'node:path';
+import { Sidecar } from './sidecar';
+import { configuredLocalOriginPort, startLocalOriginServer } from './local-origin-server';
 import { isSiteId, routeOrigin, siteIdFromHostname } from '../shared/site-id';
 import { findLaunchTarget } from './launch-target';
 
@@ -15,9 +17,10 @@ declare const SHELL_WEBPACK_ENTRY: string;
 declare const SHELL_PRELOAD_WEBPACK_ENTRY: string;
 
 const SHELL_HEIGHT = 132;
-const registeredSessions = new WeakSet<Session>();
+const LOCAL_ORIGIN_PORT = configuredLocalOriginPort();
 
 const sidecar = new Sidecar();
+let originServer: Server | undefined;
 let shellWindow: BrowserWindow | undefined;
 let siteView: WebContentsView | undefined;
 
@@ -28,46 +31,6 @@ function partitionFor(siteId: string): Session {
 function safeStartPath(value: string): string {
   if (!value.startsWith('/') || value.startsWith('//')) throw new Error('Start path must be origin-relative');
   return value;
-}
-
-function registerSiteProtocol(targetSession: Session): void {
-  if (registeredSessions.has(targetSession)) return;
-  registeredSessions.add(targetSession);
-
-  targetSession.protocol.handle('http', async (request) => {
-    const url = new URL(request.url);
-    const siteId = siteIdFromHostname(url.hostname);
-    if (!siteId) {
-      return new Response('Plain HTTP outside VeilidHttp localhost origins is blocked', {
-        status: 403,
-        headers: {
-          'content-type': 'text/plain; charset=utf-8',
-          'cache-control': 'no-store',
-        },
-      });
-    }
-
-    try {
-      const response = await sidecar.streamRequest<{
-        status: number;
-        headers: Array<[string, string]>;
-      }>('httpRequest', {
-        siteId,
-        method: request.method,
-        pathAndQuery: `${url.pathname}${url.search}`,
-        headers: [...request.headers.entries()],
-      }, request.body, request.signal);
-      return new Response(response.body, {
-        status: response.result.status,
-        headers: response.result.headers,
-      });
-    } catch (error) {
-      return new Response(error instanceof Error ? error.message : String(error), {
-        status: 502,
-        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
-      });
-    }
-  });
 }
 
 function resizeSiteView(): void {
@@ -82,7 +45,6 @@ async function openSite(siteId: string, startPath = '/'): Promise<void> {
   if (siteView) shellWindow.contentView.removeChildView(siteView);
 
   const targetSession = partitionFor(siteId);
-  registerSiteProtocol(targetSession);
   siteView = new WebContentsView({
     webPreferences: {
       session: targetSession,
@@ -97,12 +59,15 @@ async function openSite(siteId: string, startPath = '/'): Promise<void> {
   siteView.webContents.on('will-navigate', (event, navigationUrl) => {
     const destination = new URL(navigationUrl);
     const allowedVeilidOrigin = destination.protocol === 'http:'
-      && siteIdFromHostname(destination.hostname) !== undefined;
+      && siteIdFromHostname(destination.hostname) !== undefined
+      && Number(destination.port || '80') === LOCAL_ORIGIN_PORT;
     if (!allowedVeilidOrigin && destination.protocol !== 'https:') event.preventDefault();
   });
   shellWindow.contentView.addChildView(siteView);
   resizeSiteView();
-  await siteView.webContents.loadURL(new URL(safeStartPath(startPath), routeOrigin(siteId)).toString());
+  await siteView.webContents.loadURL(
+    new URL(safeStartPath(startPath), routeOrigin(siteId, LOCAL_ORIGIN_PORT)).toString(),
+  );
 }
 
 async function createShell(): Promise<void> {
@@ -139,7 +104,10 @@ ipcMain.handle('veilid-http:open-route', async (_event, input: unknown) => {
   const result = response.result;
   if (!isSiteId(result.fingerprint)) throw new Error('Sidecar returned an invalid route fingerprint');
   await openSite(result.fingerprint, startPath);
-  return { siteId: result.fingerprint, origin: routeOrigin(result.fingerprint) };
+  return {
+    siteId: result.fingerprint,
+    origin: routeOrigin(result.fingerprint, LOCAL_ORIGIN_PORT),
+  };
 });
 
 ipcMain.handle('veilid-http:clear-site-data', async (_event, siteId: unknown) => {
@@ -147,7 +115,7 @@ ipcMain.handle('veilid-http:clear-site-data', async (_event, siteId: unknown) =>
   const targetSession = partitionFor(siteId);
   await Promise.all([
     targetSession.clearCache(),
-    targetSession.clearStorageData({ origin: routeOrigin(siteId) }),
+    targetSession.clearStorageData({ origin: routeOrigin(siteId, LOCAL_ORIGIN_PORT) }),
   ]);
 });
 
@@ -159,8 +127,9 @@ ipcMain.handle('veilid-http:close-site', () => {
   }
 });
 
-app.whenReady().then(async () => {
+void app.whenReady().then(async () => {
   await sidecar.start();
+  originServer = await startLocalOriginServer(sidecar, LOCAL_ORIGIN_PORT);
   await createShell();
   const target = findLaunchTarget(process.argv.slice(1), path.dirname(process.execPath));
   if (target) {
@@ -169,11 +138,17 @@ app.whenReady().then(async () => {
     });
     await openSite(imported.result.fingerprint, target.startPath);
   }
+}).catch((error: unknown) => {
+  console.error('[VeilidHttp startup]', error);
+  app.exit(1);
 });
 
-app.on('before-quit', () => sidecar.stop());
+app.on('before-quit', () => {
+  originServer?.close();
+  sidecar.stop();
+});
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-export { partitionFor, registerSiteProtocol, safeStartPath };
+export { partitionFor, safeStartPath };
