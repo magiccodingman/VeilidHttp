@@ -21,6 +21,8 @@ use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
 use veilid_http_veilid_native::NativeVeilidTransport;
 use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
 
+const REQUEST_INPUT_CHANNEL_FRAMES: usize = 4;
+
 /// Complete response convenience type built on top of the streaming runtime.
 #[derive(Debug, Clone)]
 pub struct BufferedResponse {
@@ -48,6 +50,10 @@ pub enum ClientResponseEvent {
 pub struct ClientRequest {
     /// Bounded request-body input. Dropping the sender marks the request body complete.
     pub request_body: Option<mpsc::Sender<Bytes>>,
+    /// Credits returned after one IPC request-body frame has entered the VHTTP sender.
+    pub request_credits: Option<mpsc::Receiver<u32>>,
+    /// Initial request-body frames the local IPC producer may submit.
+    pub initial_request_credits: u32,
     /// Bounded response event stream. Consuming it controls Veilid response ACK progress.
     pub responses: mpsc::Receiver<ClientResponseEvent>,
     cancel: watch::Sender<bool>,
@@ -158,11 +164,24 @@ impl ClientRuntime {
         head: RequestHead,
         has_body: bool,
     ) -> ClientRequest {
-        let (request_sender, request_receiver) = if has_body {
-            let (sender, receiver) = mpsc::channel(4);
-            (Some(sender), Some(receiver))
+        let (
+            request_sender,
+            request_receiver,
+            request_credit_sender,
+            request_credit_receiver,
+            initial_request_credits,
+        ) = if has_body {
+            let (sender, receiver) = mpsc::channel(REQUEST_INPUT_CHANNEL_FRAMES);
+            let (credit_sender, credit_receiver) = mpsc::channel(REQUEST_INPUT_CHANNEL_FRAMES * 2);
+            (
+                Some(sender),
+                Some(receiver),
+                Some(credit_sender),
+                Some(credit_receiver),
+                u32::try_from(REQUEST_INPUT_CHANNEL_FRAMES).unwrap_or(4),
+            )
         } else {
-            (None, None)
+            (None, None, None, None, 0)
         };
         let (response_sender, response_receiver) = mpsc::channel(8);
         let (cancel_sender, cancel_receiver) = watch::channel(false);
@@ -175,6 +194,7 @@ impl ClientRuntime {
                     head,
                     has_body,
                     request_receiver,
+                    request_credit_sender,
                     response_sender,
                     cancel_receiver,
                 )
@@ -192,6 +212,8 @@ impl ClientRuntime {
         });
         ClientRequest {
             request_body: request_sender,
+            request_credits: request_credit_receiver,
+            initial_request_credits,
             responses: response_receiver,
             cancel: cancel_sender,
         }
@@ -216,6 +238,8 @@ impl ClientRuntime {
         let request = self.start_request(server_target.clone(), head, !body.is_empty());
         let ClientRequest {
             request_body,
+            request_credits: _,
+            initial_request_credits: _,
             mut responses,
             cancel: _,
         } = request;
@@ -249,12 +273,14 @@ impl ClientRuntime {
         bail!("native response event channel closed before completion")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_stream(
         &self,
         server_target: RouteTarget,
         head: RequestHead,
         has_body: bool,
         request_input: Option<mpsc::Receiver<Bytes>>,
+        request_credits: Option<mpsc::Sender<u32>>,
         response_events: mpsc::Sender<ClientResponseEvent>,
         cancel: watch::Receiver<bool>,
     ) -> Result<()> {
@@ -268,6 +294,7 @@ impl ClientRuntime {
                 head,
                 has_body,
                 request_input,
+                request_credits,
                 response_events,
                 &mut events,
                 cancel,
@@ -298,6 +325,7 @@ impl ClientRuntime {
         head: RequestHead,
         has_body: bool,
         mut request_input: Option<mpsc::Receiver<Bytes>>,
+        request_credits: Option<mpsc::Sender<u32>>,
         response_events: mpsc::Sender<ClientResponseEvent>,
         events: &mut mpsc::UnboundedReceiver<Bytes>,
         mut cancel: watch::Receiver<bool>,
@@ -487,6 +515,9 @@ impl ClientRuntime {
                                     .min(chunk.len());
                                 sender.push(&chunk[offset..end], false)?;
                                 offset = end;
+                            }
+                            if let Some(credits) = request_credits.as_ref() {
+                                let _ = credits.send(1).await;
                             }
                         }
                         None => {
