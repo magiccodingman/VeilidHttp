@@ -79,6 +79,17 @@ jobs:
       - run: cp .env.example .env
       - run: docker compose -f compose.yaml -f dev-compose.yaml config >/dev/null
       - run: sh -n docker/entrypoint.sh docker/entrypoint.dev.sh docker/healthcheck.sh scripts/validate-route-lifecycle.sh
+      - name: Pack temporary workspace snapshot
+        if: always()
+        run: tar --exclude=.git --exclude=node_modules --exclude=target -czf /tmp/veilid-http-workspace.tgz .
+      - name: Preserve temporary workspace snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-workspace-snapshot
+          path: /tmp/veilid-http-workspace.tgz
+          if-no-files-found: error
+          retention-days: 1
 
   docker-build:
     runs-on: ubuntu-latest
