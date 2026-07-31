@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,7 +14,7 @@ use veilid_http_core::RetryPolicy;
 use veilid_http_engine::{InboundBody, OutboundBody};
 use veilid_http_http::{RequestHead, ResponseHead};
 use veilid_http_stream::{
-    CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode,
+    Ack, CompressionMode, DecodedFrame, RequestOpen, ResponseOpen, StreamDirection, decode,
     encode_ack, encode_cancel, encode_request_open,
 };
 use veilid_http_transport::{RouteTarget, TransportEvent, VeilidTransport};
@@ -77,6 +77,46 @@ struct ReturnRoute {
     target: RouteTarget,
     blob: Bytes,
     fingerprint: String,
+}
+
+#[derive(Debug)]
+struct PendingResponseFrames {
+    frames: VecDeque<Bytes>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl PendingResponseFrames {
+    fn new(limit: usize) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, frame: Bytes) -> Result<()> {
+        let next = self.bytes.saturating_add(frame.len());
+        if next > self.limit {
+            bail!(
+                "response frames received before ResponseOpen exceeded the {} byte bound",
+                self.limit
+            );
+        }
+        self.bytes = next;
+        self.frames.push_back(frame);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<Bytes> {
+        let frame = self.frames.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(frame.len());
+        Some(frame)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
 }
 
 /// Native client runtime with one rotating private return route.
@@ -385,8 +425,10 @@ impl ClientRuntime {
         };
         let mut request_finished = !has_body;
         let mut request_bytes = 0_u64;
-        let mut response_head_sent = false;
+        let mut response_open: Option<ResponseOpen> = None;
         let mut response_receiver: Option<InboundBody> = None;
+        let mut pending_response_frames = PendingResponseFrames::new(self.max_out_of_order_bytes);
+        let mut last_response_ack: Option<Ack> = None;
         let mut response_finished = false;
         let deadline = tokio::time::sleep(self.overall_timeout);
         tokio::pin!(deadline);
@@ -421,65 +463,91 @@ impl ClientRuntime {
                         DecodedFrame::ResponseOpen { transaction_id: id, value, initial_payload }
                             if id == transaction_id =>
                         {
-                            if response_head_sent {
-                                bail!("duplicate conflicting ResponseOpen");
-                            }
                             if !initial_payload.is_empty() {
                                 bail!("ResponseOpen initial payload is reserved until sequenced initial-data support is enabled");
                             }
-                            let ResponseOpen {
-                                head,
-                                response_compression,
-                                response_body,
-                                request_receive_window,
-                            } = value;
-                            if request_receive_window > 64 {
+                            if value.request_receive_window > 64 {
                                 bail!("server returned an invalid updated request receive window");
                             }
+                            if let Some(existing) = response_open.as_ref() {
+                                if existing != &value {
+                                    bail!("duplicate conflicting ResponseOpen");
+                                }
+                                self.send_response_ack(
+                                    server_target,
+                                    transaction_id,
+                                    last_response_ack.unwrap_or_else(|| self.empty_response_ack()),
+                                )
+                                .await?;
+                                continue;
+                            }
                             if let Some(sender) = request_sender.as_mut() {
-                                sender.set_peer_window(request_receive_window)?;
+                                sender.set_peer_window(value.request_receive_window)?;
                             }
                             response_events
-                                .send(ClientResponseEvent::Head(head))
+                                .send(ClientResponseEvent::Head(value.head.clone()))
                                 .await
                                 .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
-                            response_head_sent = true;
-                            if response_body {
+                            if value.response_body {
                                 response_receiver = Some(InboundBody::new(
                                     transaction_id,
                                     StreamDirection::Response,
-                                    response_compression,
+                                    value.response_compression,
                                     u32::try_from(self.window_frames).unwrap_or(32),
                                     self.max_out_of_order_bytes,
                                     if self.max_response_bytes == 0 { u64::MAX } else { self.max_response_bytes },
                                 )?);
                             } else {
+                                if !pending_response_frames.is_empty() {
+                                    bail!("response body frames arrived for a bodyless response");
+                                }
                                 response_finished = true;
                             }
+                            response_open = Some(value);
+
+                            while let Some(pending) = pending_response_frames.pop() {
+                                let receiver = response_receiver
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow::anyhow!("response body frame arrived for a bodyless response"))?;
+                                let (completed, ack, _) = self
+                                    .receive_response_frame(
+                                        transaction_id,
+                                        pending,
+                                        receiver,
+                                        &response_events,
+                                    )
+                                    .await?;
+                                last_response_ack = Some(ack);
+                                response_finished |= completed;
+                            }
+                            self.send_response_ack(
+                                server_target,
+                                transaction_id,
+                                last_response_ack.unwrap_or_else(|| self.empty_response_ack()),
+                            )
+                            .await?;
                         }
-                        DecodedFrame::Data { transaction_id: id, direction: StreamDirection::Response, sequence, .. }
-                        | DecodedFrame::End { transaction_id: id, sequence, value: veilid_http_stream::StreamEnd { direction: StreamDirection::Response, .. } }
+                        DecodedFrame::Data { transaction_id: id, direction: StreamDirection::Response, .. }
+                        | DecodedFrame::End { transaction_id: id, value: veilid_http_stream::StreamEnd { direction: StreamDirection::Response, .. }, .. }
                             if id == transaction_id =>
                         {
-                            let receiver = response_receiver
-                                .as_mut()
-                                .ok_or_else(|| anyhow::anyhow!("response data arrived before ResponseOpen"))?;
-                            let output = receiver.receive(frame)?;
-                            for chunk in output.logical_chunks {
-                                response_events
-                                    .send(ClientResponseEvent::Data(chunk))
-                                    .await
-                                    .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
-                            }
-                            if output.completed || output.ack.selective != 0 || sequence % 4 == 3 {
-                                self.send_encoded_frames(
-                                    server_target,
-                                    vec![encode_ack(transaction_id, output.ack)?],
+                            let Some(receiver) = response_receiver.as_mut() else {
+                                pending_response_frames.push(frame)?;
+                                continue;
+                            };
+                            let (completed, ack, sequence) = self
+                                .receive_response_frame(
+                                    transaction_id,
+                                    frame,
+                                    receiver,
+                                    &response_events,
                                 )
-                                .await
-                                .context("send response-stream ACK")?;
+                                .await?;
+                            last_response_ack = Some(ack);
+                            if completed || ack.selective != 0 || sequence & 3 == 3 {
+                                self.send_response_ack(server_target, transaction_id, ack).await?;
                             }
-                            response_finished = output.completed;
+                            response_finished = completed;
                         }
                         DecodedFrame::Error { transaction_id: id, value } if id == transaction_id => {
                             bail!("server stream error {}: {}", value.code, value.message);
@@ -544,10 +612,68 @@ impl ClientRuntime {
                 }
             }
         }
-        if !response_head_sent {
+        if response_open.is_none() {
             bail!("transaction completed without ResponseOpen");
         }
         Ok(())
+    }
+
+    fn empty_response_ack(&self) -> Ack {
+        Ack {
+            direction: StreamDirection::Response,
+            cumulative: None,
+            selective: 0,
+            receive_window: u32::try_from(self.window_frames).unwrap_or(32),
+        }
+    }
+
+    async fn receive_response_frame(
+        &self,
+        transaction_id: [u8; 16],
+        encoded: Bytes,
+        receiver: &mut InboundBody,
+        response_events: &mpsc::Sender<ClientResponseEvent>,
+    ) -> Result<(bool, Ack, u32)> {
+        let sequence = match decode(encoded.clone())? {
+            DecodedFrame::Data {
+                transaction_id: id,
+                direction: StreamDirection::Response,
+                sequence,
+                ..
+            }
+            | DecodedFrame::End {
+                transaction_id: id,
+                sequence,
+                value:
+                    veilid_http_stream::StreamEnd {
+                        direction: StreamDirection::Response,
+                        ..
+                    },
+            } if id == transaction_id => sequence,
+            _ => bail!("expected response data or end frame"),
+        };
+        let output = receiver.receive(encoded)?;
+        for chunk in output.logical_chunks {
+            response_events
+                .send(ClientResponseEvent::Data(chunk))
+                .await
+                .map_err(|_| anyhow::anyhow!("local response consumer disconnected"))?;
+        }
+        Ok((output.completed, output.ack, sequence))
+    }
+
+    async fn send_response_ack(
+        &self,
+        server_target: &RouteTarget,
+        transaction_id: [u8; 16],
+        ack: Ack,
+    ) -> Result<()> {
+        self.send_encoded_frames(
+            server_target,
+            vec![encode_ack(transaction_id, ack)?],
+        )
+        .await
+        .context("send response-stream ACK")
     }
 
     async fn dispatch_request_frames(
@@ -700,4 +826,18 @@ fn split_frames(payload: Bytes) -> Result<Vec<Bytes>> {
     }
     Frame::decode(payload.clone()).context("decode VHTTP client AppMessage")?;
     Ok(vec![payload])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_open_response_buffer_is_strictly_bounded() {
+        let mut pending = PendingResponseFrames::new(5);
+        pending.push(Bytes::from_static(b"abc")).unwrap();
+        assert!(pending.push(Bytes::from_static(b"def")).is_err());
+        assert_eq!(pending.pop().as_deref(), Some(b"abc".as_slice()));
+        assert!(pending.is_empty());
+    }
 }
