@@ -80,6 +80,36 @@ The loopback server also:
 
 This prevents another local browser page or ordinary local process from using the VeilidHttp gateway merely because it can reach the port.
 
+## Packaged Electron binary
+
+The packaged application applies Electron's fuse policy during Forge packaging and requires every known v1 fuse to be stated explicitly. CI packages the Linux client and reads the resulting executable's fuse wire rather than trusting the source configuration alone.
+
+The enforced policy is:
+
+- Electron cannot be launched as a generic Node.js process
+- inherited `NODE_OPTIONS` behavior is disabled
+- command-line Node inspection arguments are disabled
+- encrypted Chromium cookies are enabled
+- embedded ASAR integrity validation is enabled
+- application code must load from the packaged ASAR archive
+- the browser process uses its dedicated V8 snapshot
+- legacy elevated privileges for `file://` content are disabled
+
+These controls harden the trusted Electron package itself. They do not add an API or capability to loaded applications.
+
+## Validation
+
+The Electron CI job performs all of the following against the committed lockfile:
+
+- privilege-boundary regression tests
+- TypeScript compilation
+- HTTP fixture tests
+- Chromium service-worker, storage, CORS, and streaming smoke tests
+- an actual Linux Electron package build with a bundled transport fixture
+- inspection of the packaged executable's fuse states
+
+A change that reopens privileged permissions, generic top-level navigation, unauthenticated loopback access, packaged executable substitution, or Electron command-line escape hatches is expected to fail this validation.
+
 ## Explicit non-goals
 
 The current Electron client does not provide:
