@@ -26,5 +26,25 @@ veilid-http-transport = { path = "../../crates/veilid-http-transport" }
 veilid-http-veilid-native = { path = "../../crates/veilid-http-veilid-native" }
 veilid-http-wire = { path = "../../crates/veilid-http-wire" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+# The buffered convenience surface remains available for native harnesses during alpha.
+dead_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+# These cohesive IPC and streaming state-machine loops are clearer kept together.
+too_many_lines = "allow"
+collapsible_if = "allow"
+single_match_else = "allow"
+# These names mirror the serialized IPC vocabulary consumed by Electron.
+enum_variant_names = "allow"
+struct_field_names = "allow"
+redundant_closure = "allow"
