@@ -88,21 +88,27 @@ export class Sidecar {
 
   private async startInternal(): Promise<void> {
     const name = process.platform === 'win32' ? 'veilid-http-native.exe' : 'veilid-http-native';
-    const executable = process.env.VEILID_HTTP_NATIVE_PATH
-      ?? (app.isPackaged
-        ? path.join(process.resourcesPath, name)
-        : path.resolve(__dirname, '../../../../target/debug', name));
+    const executable = app.isPackaged
+      ? path.join(process.resourcesPath, name)
+      : process.env.VEILID_HTTP_NATIVE_PATH
+        ?? path.resolve(__dirname, '../../../../target/debug', name);
     const suffix = `${process.pid}-${crypto.randomBytes(12).toString('hex')}`;
     const ipcPath = process.platform === 'win32'
       ? `\\\\.\\pipe\\veilid-http-${suffix}`
       : path.join(os.tmpdir(), `veilid-http-${suffix}.sock`);
     const secret = crypto.randomBytes(32).toString('base64url');
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.VEILID_HTTP_NATIVE_PATH;
+    delete childEnvironment.VHTTP_CLIENT_DATA_DIR;
+    delete childEnvironment.VHTTP_IPC_PATH;
+    delete childEnvironment.VHTTP_IPC_SECRET;
 
     this.child = spawn(executable, [], {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
+      shell: false,
       env: {
-        ...process.env,
+        ...childEnvironment,
         VHTTP_CLIENT_DATA_DIR: path.join(app.getPath('userData'), 'native'),
         VHTTP_IPC_PATH: ipcPath,
         VHTTP_IPC_SECRET: secret,
