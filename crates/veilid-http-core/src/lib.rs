@@ -423,19 +423,32 @@ pub enum CoreError {
     InvalidWindowCapacity,
     /// No more frames fit in the current send window.
     #[error("send window is full at {capacity} frames")]
-    SendWindowFull { capacity: usize },
+    SendWindowFull {
+        /// Maximum number of frames the window can retain.
+        capacity: usize,
+    },
     /// Per-direction sequence number space was exhausted.
     #[error("sequence number space exhausted")]
     SequenceExhausted,
     /// Out-of-order buffering exceeded its configured bound.
     #[error("pending reassembly bytes {actual} exceed limit {limit}")]
-    PendingLimit { actual: usize, limit: usize },
+    PendingLimit {
+        /// Pending bytes observed after the rejected insertion.
+        actual: usize,
+        /// Configured maximum pending bytes.
+        limit: usize,
+    },
     /// Zstandard operation failed.
     #[error("zstandard operation failed: {0}")]
     Compression(std::io::Error),
     /// Decoded data exceeded its configured logical bound.
     #[error("decompressed bytes {actual} exceed limit {limit}")]
-    DecompressedLimit { actual: usize, limit: usize },
+    DecompressedLimit {
+        /// Decoded bytes observed or declared.
+        actual: usize,
+        /// Configured maximum decoded bytes.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]

@@ -27,8 +27,10 @@ pub enum CompletionClaim {
     /// The transaction completed, may have completed before a crash, or could not be
     /// durably claimed. It must not be automatically forwarded again.
     Tombstone,
-    /// Another execution or the global capacity bound must change before retrying.
-    Wait(Arc<Notify>),
+    /// The same transaction is already executing and must complete before retrying.
+    WaitDuplicate(Arc<Notify>),
+    /// The process-wide execution bound is full and must free capacity before retrying.
+    WaitCapacity(Arc<Notify>),
 }
 
 /// Existing completed state used by streamed opening deduplication.
@@ -179,7 +181,7 @@ impl CompletionStore {
         let mut entries = self.entries.lock().await;
         self.prune_locked(&mut entries);
         match entries.get(&id) {
-            Some(Entry::InFlight(notify)) => CompletionClaim::Wait(Arc::clone(notify)),
+            Some(Entry::InFlight(notify)) => CompletionClaim::WaitDuplicate(Arc::clone(notify)),
             Some(Entry::Complete {
                 response: Some(response),
                 ..
@@ -191,7 +193,7 @@ impl CompletionStore {
                     .filter(|entry| matches!(entry, Entry::InFlight(_)))
                     .count();
                 if active >= self.max_in_flight {
-                    return CompletionClaim::Wait(Arc::clone(&self.capacity_notify));
+                    return CompletionClaim::WaitCapacity(Arc::clone(&self.capacity_notify));
                 }
 
                 let expires_at = match now_unix_seconds() {
@@ -570,7 +572,7 @@ mod tests {
             CompletionClaim::Execute
         ));
         let waiting = match store.claim([2; 16]).await {
-            CompletionClaim::Wait(notify) => notify,
+            CompletionClaim::WaitCapacity(notify) => notify,
             other => panic!("expected capacity wait, got {other:?}"),
         };
         store.abandon([1; 16]).await;
@@ -593,7 +595,7 @@ mod tests {
             CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         let waiting = match store.claim(id).await {
-            CompletionClaim::Wait(notify) => notify,
+            CompletionClaim::WaitDuplicate(notify) => notify,
             other => panic!("expected duplicate wait, got {other:?}"),
         };
         store

@@ -414,7 +414,7 @@ async fn handle_atomic_call(
                 }
                 return;
             }
-            CompletionClaim::Wait(notify) => {
+            CompletionClaim::WaitDuplicate(notify) | CompletionClaim::WaitCapacity(notify) => {
                 let elapsed = waiting_started.elapsed();
                 if elapsed >= config.overall_timeout {
                     let response = small_error_response(

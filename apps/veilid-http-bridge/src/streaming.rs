@@ -172,7 +172,24 @@ impl StreamingBridge {
 
         match self.completion.claim(transaction_id).await {
             CompletionClaim::Execute => {}
-            CompletionClaim::Wait(_) | CompletionClaim::Replay(_) | CompletionClaim::Tombstone => {
+            CompletionClaim::WaitCapacity(_) => {
+                let reply = encode_error(
+                    transaction_id,
+                    &StreamError {
+                        code: "server-busy".to_owned(),
+                        message: "the bridge has reached its active transaction limit".to_owned(),
+                        retryable: true,
+                    },
+                )?;
+                self.transport
+                    .app_call_reply(call_id, reply)
+                    .await
+                    .context("reply to capacity-limited RequestOpen")?;
+                return Ok(());
+            }
+            CompletionClaim::WaitDuplicate(_)
+            | CompletionClaim::Replay(_)
+            | CompletionClaim::Tombstone => {
                 let reply = encode_error(
                     transaction_id,
                     &StreamError {
