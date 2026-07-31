@@ -21,7 +21,13 @@ fn end_waits_for_missing_data_and_duplicates_deliver_once() {
     sender.push(b"beta", true).unwrap();
     sender.finish_input().unwrap();
     let mut frames = sender
-        .take_sendable(0, RetryPolicy { initial_ms: 10, maximum_ms: 100 })
+        .take_sendable(
+            0,
+            RetryPolicy {
+                initial_ms: 10,
+                maximum_ms: 100,
+            },
+        )
         .into_iter()
         .map(|frame| frame.encoded)
         .collect::<Vec<_>>();
@@ -41,10 +47,16 @@ fn end_waits_for_missing_data_and_duplicates_deliver_once() {
     .unwrap();
     assert!(!receiver.receive(end).unwrap().completed);
     let first_output = receiver.receive(first.clone()).unwrap();
-    assert_eq!(first_output.logical_chunks, vec![Bytes::from_static(b"alpha")]);
+    assert_eq!(
+        first_output.logical_chunks,
+        vec![Bytes::from_static(b"alpha")]
+    );
     assert!(receiver.receive(first).unwrap().logical_chunks.is_empty());
     let second_output = receiver.receive(second).unwrap();
-    assert_eq!(second_output.logical_chunks, vec![Bytes::from_static(b"beta")]);
+    assert_eq!(
+        second_output.logical_chunks,
+        vec![Bytes::from_static(b"beta")]
+    );
     assert!(second_output.completed);
 }
 
@@ -79,7 +91,10 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         u64::try_from(input.len()).unwrap(),
     )
     .unwrap();
-    let policy = RetryPolicy { initial_ms: 10, maximum_ms: 100 };
+    let policy = RetryPolicy {
+        initial_ms: 10,
+        maximum_ms: 100,
+    };
     let mut now = 0;
     let mut dropped_one = false;
     let mut output = Vec::new();
@@ -89,7 +104,9 @@ fn dropped_frame_is_selectively_retried_and_large_stream_stays_bounded() {
         sent.reverse();
         for retained in sent {
             let sequence = match decode(retained.encoded.clone()).unwrap() {
-                DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. } => sequence,
+                DecodedFrame::Data { sequence, .. } | DecodedFrame::End { sequence, .. } => {
+                    sequence
+                }
                 _ => unreachable!(),
             };
             if sequence == 1 && !dropped_one {

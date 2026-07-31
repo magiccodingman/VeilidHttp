@@ -1,0 +1,13 @@
+name: Fix Rust lint pass
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disabled:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'The one-time lint maintenance pass has completed.'

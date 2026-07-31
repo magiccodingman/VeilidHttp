@@ -24,9 +24,7 @@ use veilid_http_stream::{
     CompressionMode, DecodedFrame, RequestOpen, StreamDirection, decode, encode_ack,
     encode_request_open,
 };
-use veilid_http_transport::{
-    RouteTarget, TransportError, TransportEvent, VeilidTransport,
-};
+use veilid_http_transport::{RouteTarget, TransportError, TransportEvent, VeilidTransport};
 use veilid_http_wire::{Frame, FrameBundle};
 
 #[derive(Debug)]
@@ -75,11 +73,7 @@ impl VeilidTransport for MockTransport {
             .map_err(|_| TransportError::Shutdown)
     }
 
-    async fn app_call_reply(
-        &self,
-        call_id: &str,
-        payload: Bytes,
-    ) -> Result<(), TransportError> {
+    async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError> {
         self.replies
             .send((call_id.to_owned(), payload))
             .map_err(|_| TransportError::Shutdown)

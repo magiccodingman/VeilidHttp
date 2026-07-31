@@ -1,10 +1,17 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "veilid-http-cli", version, about = "VeilidHttp route and server tooling")]
+#[command(
+    name = "veilid-http-cli",
+    version,
+    about = "VeilidHttp route and server tooling"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -66,7 +73,10 @@ enum TransferCommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum ExportFormat { Base64, Descriptor }
+enum ExportFormat {
+    Base64,
+    Descriptor,
+}
 
 #[derive(Debug, Serialize)]
 struct Descriptor<'a> {
@@ -165,7 +175,11 @@ fn list_transfer_entries(data_dir: &Path) -> Result<Vec<TransferEntry>> {
             entries.push(TransferEntry {
                 area: area.to_owned(),
                 name: item.file_name().to_string_lossy().into_owned(),
-                bytes: if metadata.is_file() { metadata.len() } else { 0 },
+                bytes: if metadata.is_file() {
+                    metadata.len()
+                } else {
+                    0
+                },
             });
         }
     }
@@ -185,7 +199,10 @@ fn main() -> Result<()> {
                     println!("fingerprint_verified={}", report.fingerprint_verified);
                     println!("route_id={}", report.metadata.route_id);
                     println!("veilid_version={}", report.metadata.veilid_version);
-                    println!("created_at_unix_seconds={}", report.metadata.created_at_unix_seconds);
+                    println!(
+                        "created_at_unix_seconds={}",
+                        report.metadata.created_at_unix_seconds
+                    );
                     println!("blob_bytes={}", report.blob_bytes);
                     println!("base64_bytes={}", report.base64_bytes);
                 }
@@ -209,7 +226,9 @@ fn main() -> Result<()> {
                     ),
                 }
             }
-            RouteCommand::Fingerprint { file } => println!("{}", veilid_http_route::fingerprint(&read(&file)?)),
+            RouteCommand::Fingerprint { file } => {
+                println!("{}", veilid_http_route::fingerprint(&read(&file)?))
+            }
         },
         Command::Status { data_dir, json } => {
             if !data_dir.exists() {
@@ -217,7 +236,10 @@ fn main() -> Result<()> {
             }
             let route = route_report(&data_dir).ok();
             let report = StatusReport {
-                status: if route.as_ref().is_some_and(|value| value.fingerprint_verified) {
+                status: if route
+                    .as_ref()
+                    .is_some_and(|value| value.fingerprint_verified)
+                {
                     "ready"
                 } else {
                     "not-ready"
@@ -225,8 +247,12 @@ fn main() -> Result<()> {
                 data_dir: data_dir.display().to_string(),
                 route_present: data_dir.join("route/current.blob").is_file(),
                 route_metadata_present: data_dir.join("route/current.json").is_file(),
-                route_fingerprint: route.as_ref().map(|value| value.metadata.fingerprint.clone()),
-                veilid_version: route.as_ref().map(|value| value.metadata.veilid_version.clone()),
+                route_fingerprint: route
+                    .as_ref()
+                    .map(|value| value.metadata.fingerprint.clone()),
+                veilid_version: route
+                    .as_ref()
+                    .map(|value| value.metadata.veilid_version.clone()),
                 active_transfer_entries: count_entries(&data_dir.join("transfers"))?,
                 completed_entries: count_entries(&data_dir.join("completed"))?,
                 spool_entries: count_entries(&data_dir.join("spool"))?,
@@ -238,8 +264,14 @@ fn main() -> Result<()> {
                 println!("data_dir={}", report.data_dir);
                 println!("route_present={}", report.route_present);
                 println!("route_metadata_present={}", report.route_metadata_present);
-                println!("route_fingerprint={}", report.route_fingerprint.as_deref().unwrap_or(""));
-                println!("veilid_version={}", report.veilid_version.as_deref().unwrap_or(""));
+                println!(
+                    "route_fingerprint={}",
+                    report.route_fingerprint.as_deref().unwrap_or("")
+                );
+                println!(
+                    "veilid_version={}",
+                    report.veilid_version.as_deref().unwrap_or("")
+                );
                 println!("active_transfer_entries={}", report.active_transfer_entries);
                 println!("completed_entries={}", report.completed_entries);
                 println!("spool_entries={}", report.spool_entries);
@@ -257,7 +289,10 @@ fn main() -> Result<()> {
                     println!("no retained transfer entries");
                 } else {
                     for entry in entries {
-                        println!("area={} name={} bytes={}", entry.area, entry.name, entry.bytes);
+                        println!(
+                            "area={} name={} bytes={}",
+                            entry.area, entry.name, entry.bytes
+                        );
                     }
                 }
             }
