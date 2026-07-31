@@ -14,6 +14,25 @@ permissions:
   contents: read
 
 jobs:
+  veilid-api-shape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+      - name: Fetch pinned Veilid sources
+        run: cargo metadata --format-version 1 >/dev/null
+      - name: Print Target and RouteId conversions
+        shell: bash
+        run: |
+          root=$(find "$HOME/.cargo/git/checkouts" -type d -path '*/veilid-core/src' | head -n 1)
+          test -n "$root"
+          echo "Veilid source root: $root"
+          grep -R -n -A20 -B5 'pub enum Target\|pub struct Target' "$root" | head -n 120
+          grep -R -n -A8 -B3 'impl From<.*RouteId.*Target\|impl TryFrom<.*RouteId.*Target' "$root" | head -n 120 || true
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -52,7 +71,7 @@ jobs:
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
-      - name: Verify service workers, storage, CORS, and streams on veilid://
+      - name: Verify service workers, storage, CORS, and streams on loopback origins
         run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
 
