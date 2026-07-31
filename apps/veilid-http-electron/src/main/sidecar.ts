@@ -186,7 +186,7 @@ export class Sidecar {
         rejectHead: reject,
         controller,
         headResolved: false,
-        responseCredits: INITIAL_RESPONSE_CREDITS,
+        responseCredits: 0,
         cleanup,
       });
       abortListener = (): void => this.cancelStream(requestId, signal?.reason instanceof Error
@@ -204,7 +204,6 @@ export class Sidecar {
           type,
           ...fields,
           hasBody: requestBody !== null,
-          responseCredits: INITIAL_RESPONSE_CREDITS,
         }, Buffer.alloc(0));
       } catch (error) {
         this.failStream(requestId, toError(error), false);
