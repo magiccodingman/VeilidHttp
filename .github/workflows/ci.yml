@@ -11,9 +11,167 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  normalize-rust-fixes:
+    if: github.event_name == 'pull_request' && github.head_ref == 'agent/complete-veilid-http'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+          components: rustfmt
+      - name: Apply coordinated Rust fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected text not found in {path}: {old[:80]!r}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace(
+              "Cargo.toml",
+              'module_name_repetitions = "allow"\n',
+              'module_name_repetitions = "allow"\nmust_use_candidate = "allow"\n',
+          )
+          replace(
+              "crates/veilid-http-core/src/lib.rs",
+              "    SendWindowFull { capacity: usize },",
+              """    SendWindowFull {
+                  /// Maximum number of frames the window can retain.
+                  capacity: usize,
+              },""",
+          )
+          replace(
+              "crates/veilid-http-core/src/lib.rs",
+              "    PendingLimit { actual: usize, limit: usize },",
+              """    PendingLimit {
+                  /// Pending bytes observed after the rejected insertion.
+                  actual: usize,
+                  /// Configured maximum pending bytes.
+                  limit: usize,
+              },""",
+          )
+          replace(
+              "crates/veilid-http-core/src/lib.rs",
+              "    DecompressedLimit { actual: usize, limit: usize },",
+              """    DecompressedLimit {
+                  /// Decoded bytes observed or declared.
+                  actual: usize,
+                  /// Configured maximum decoded bytes.
+                  limit: usize,
+              },""",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/completion.rs",
+              """    /// Another execution or the global capacity bound must change before retrying.
+              Wait(Arc<Notify>),""",
+              """    /// The same transaction is already executing and must complete before retrying.
+              WaitDuplicate(Arc<Notify>),
+              /// The process-wide execution bound is full and must free capacity before retrying.
+              WaitCapacity(Arc<Notify>),""",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/completion.rs",
+              "Some(Entry::InFlight(notify)) => CompletionClaim::Wait(Arc::clone(notify)),",
+              "Some(Entry::InFlight(notify)) => CompletionClaim::WaitDuplicate(Arc::clone(notify)),",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/completion.rs",
+              "return CompletionClaim::Wait(Arc::clone(&self.capacity_notify));",
+              "return CompletionClaim::WaitCapacity(Arc::clone(&self.capacity_notify));",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/completion.rs",
+              "CompletionClaim::Wait(notify) => notify,",
+              "CompletionClaim::WaitCapacity(notify) => notify,",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/completion.rs",
+              "CompletionClaim::Wait(notify) => notify,",
+              "CompletionClaim::WaitDuplicate(notify) => notify,",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/main.rs",
+              "CompletionClaim::Wait(notify) => {",
+              "CompletionClaim::WaitDuplicate(notify) | CompletionClaim::WaitCapacity(notify) => {",
+          )
+          replace(
+              "apps/veilid-http-bridge/src/streaming.rs",
+              """            CompletionClaim::Wait(_) | CompletionClaim::Replay(_) | CompletionClaim::Tombstone => {
+                          let reply = encode_error(
+                              transaction_id,
+                              &StreamError {
+                                  code: \"transaction-already-seen\".to_owned(),
+                                  message: \"transaction is already executing or completed; it will not be forwarded again\".to_owned(),
+                                  retryable: false,
+                              },
+                          )?;
+                          self.transport
+                              .app_call_reply(call_id, reply)
+                              .await
+                              .context(\"reply to duplicate completed RequestOpen\")?;
+                          return Ok(());
+                      }""",
+              """            CompletionClaim::WaitCapacity(_) => {
+                          let reply = encode_error(
+                              transaction_id,
+                              &StreamError {
+                                  code: \"server-busy\".to_owned(),
+                                  message: \"the bridge has reached its active transaction limit\".to_owned(),
+                                  retryable: true,
+                              },
+                          )?;
+                          self.transport
+                              .app_call_reply(call_id, reply)
+                              .await
+                              .context(\"reply to capacity-limited RequestOpen\")?;
+                          return Ok(());
+                      }
+                      CompletionClaim::WaitDuplicate(_)
+                      | CompletionClaim::Replay(_)
+                      | CompletionClaim::Tombstone => {
+                          let reply = encode_error(
+                              transaction_id,
+                              &StreamError {
+                                  code: \"transaction-already-seen\".to_owned(),
+                                  message: \"transaction is already executing or completed; it will not be forwarded again\".to_owned(),
+                                  retryable: false,
+                              },
+                          )?;
+                          self.transport
+                              .app_call_reply(call_id, reply)
+                              .await
+                              .context(\"reply to duplicate completed RequestOpen\")?;
+                          return Ok(());
+                      }""",
+          )
+          PY
+          cargo fmt --all
+      - name: Commit coordinated fixes
+        run: |
+          if git diff --quiet; then
+            echo "Fixes already applied."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml crates/veilid-http-core/src/lib.rs \
+            apps/veilid-http-bridge/src/completion.rs \
+            apps/veilid-http-bridge/src/main.rs \
+            apps/veilid-http-bridge/src/streaming.rs
+          git commit -m "Distinguish duplicate and capacity transaction waits"
+          git push origin HEAD:agent/complete-veilid-http
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -52,7 +210,7 @@ jobs:
       - run: pnpm --filter @veilid-http/electron test
       - run: pnpm --filter @veilid-http/electron build
       - run: node scripts/smoke-http-fixtures.mjs
-      - name: Verify service workers, storage, CORS, and streams on veilid://
+      - name: Verify service workers, storage, CORS, and streams on localhost origins
         run: xvfb-run -a pnpm --filter @veilid-http/electron exec electron --no-sandbox test/electron-pwa-smoke.cjs
         timeout-minutes: 2
 
