@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict');
+const { once } = require('node:events');
+const { createServer } = require('node:http');
 const {
   app,
   BrowserWindow,
@@ -7,11 +9,10 @@ const {
 
 const SITE_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaa';
 const SITE_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbb';
-const ORIGIN_A = `http://${SITE_A}.veilid.localhost`;
-const ORIGIN_B = `http://${SITE_B}.veilid.localhost`;
+let ORIGIN_A;
+let ORIGIN_B;
 
-function responseFor(request) {
-  const url = new URL(request.url);
+function responseFor(url) {
   if (![`${SITE_A}.veilid.localhost`, `${SITE_B}.veilid.localhost`].includes(url.hostname)) {
     return new Response('plaintext HTTP outside the virtual Veilid origins is blocked', {
       status: 403,
@@ -76,11 +77,51 @@ function responseFor(request) {
   });
 }
 
-async function waitForServiceWorker(window) {
+async function writeResponse(webResponse, response) {
+  response.statusCode = webResponse.status;
+  for (const [name, value] of webResponse.headers.entries()) response.appendHeader(name, value);
+  if (!webResponse.body) {
+    response.end();
+    return;
+  }
+  const reader = webResponse.body.getReader();
+  while (true) {
+    const item = await reader.read();
+    if (item.done) break;
+    if (!response.write(Buffer.from(item.value))) await once(response, 'drain');
+  }
+  response.end();
+}
+
+async function startOriginServer() {
+  const server = createServer(async (request, response) => {
+    try {
+      if (!request.headers.host) throw new Error('missing Host header');
+      const url = new URL(request.url ?? '/', `http://${request.headers.host}`);
+      await writeResponse(responseFor(url), response);
+    } catch (error) {
+      response.statusCode = 500;
+      response.end(error instanceof Error ? error.message : String(error));
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('loopback test server did not expose a TCP port');
+  ORIGIN_A = `http://${SITE_A}.veilid.localhost:${address.port}`;
+  ORIGIN_B = `http://${SITE_B}.veilid.localhost:${address.port}`;
+  return server;
+}
+
+async function waitForServiceWorker(window, requireController = false) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     const ready = await window.webContents.executeJavaScript(
-      'window.registrationReady ? window.registrationReady.catch(() => false) : false',
+      `window.registrationReady
+        ? window.registrationReady.then(() => ${requireController ? 'Boolean(navigator.serviceWorker.controller)' : 'true'}).catch(() => false)
+        : false`,
       true,
     );
     if (ready) return;
@@ -145,9 +186,9 @@ async function browserAssertions(window) {
 }
 
 app.whenReady().then(async () => {
+  const originServer = await startOriginServer();
   const partitionName = `persist:veilid-pwa-smoke-${process.pid}`;
   const targetSession = session.fromPartition(partitionName, { cache: true });
-  targetSession.protocol.handle('http', responseFor);
   const window = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -163,7 +204,7 @@ app.whenReady().then(async () => {
     await window.loadURL(`${ORIGIN_A}/`);
     await waitForServiceWorker(window);
     await window.webContents.reload();
-    await waitForServiceWorker(window);
+    await waitForServiceWorker(window, true);
     const result = await browserAssertions(window);
     assert.equal(result.cached, 'cached-value');
     assert.equal(result.indexed, 'indexed-value');
@@ -196,9 +237,11 @@ app.whenReady().then(async () => {
     assert.equal(persisted, 'cached-value');
     reopened.destroy();
     await targetSession.clearStorageData();
+    await new Promise(resolve => originServer.close(resolve));
     app.exit(0);
   } catch (error) {
     console.error(error);
+    originServer.close();
     app.exit(1);
   }
 });
