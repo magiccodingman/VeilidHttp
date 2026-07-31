@@ -212,9 +212,21 @@ pub struct Hello {
     pub secret: String,
 }
 
+/// Which logical stream direction receives additional capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpcStreamDirection {
+    /// Electron may send additional request-body chunks to Rust.
+    Request,
+    /// Rust may send additional response-body chunks to Electron.
+    Response,
+}
+
 /// Per-request stream delivery credit update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCredit {
+    /// Logical body direction whose capacity is being increased.
+    pub direction: IpcStreamDirection,
     /// Additional body chunks the receiver is ready to accept.
     pub credits: u32,
 }
@@ -293,9 +305,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_credit_round_trips() {
+    async fn directional_stream_credit_round_trips() {
         let (mut client, mut server) = tokio::io::duplex(4096);
-        let credit = StreamCredit { credits: 4 };
+        let credit = StreamCredit {
+            direction: IpcStreamDirection::Response,
+            credits: 4,
+        };
         let expected = IpcFrame::from_metadata(
             FrameKind::StreamCredit,
             73,
@@ -313,13 +328,25 @@ mod tests {
 
     #[test]
     fn stream_credit_is_bounded() {
-        assert!(StreamCredit { credits: 1 }.validate().is_ok());
+        assert!(
+            StreamCredit {
+                direction: IpcStreamDirection::Request,
+                credits: 1,
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(matches!(
-            StreamCredit { credits: 0 }.validate(),
+            StreamCredit {
+                direction: IpcStreamDirection::Request,
+                credits: 0,
+            }
+            .validate(),
             Err(IpcError::InvalidStreamCredits(0))
         ));
         assert!(matches!(
             StreamCredit {
+                direction: IpcStreamDirection::Response,
                 credits: MAX_STREAM_CREDITS + 1,
             }
             .validate(),
