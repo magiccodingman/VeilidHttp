@@ -420,7 +420,7 @@ impl VeilidTransport for RemoteVeilidTransport {
     ) -> Result<Bytes, TransportError> {
         match self
             .routing_request(RoutingContextRequestOp::AppCall {
-                target: Target::PrivateRoute(parse_route(target)?),
+                target: Target::RouteId(parse_route(target)?),
                 message: payload.to_vec(),
             })
             .await?
@@ -441,7 +441,7 @@ impl VeilidTransport for RemoteVeilidTransport {
     ) -> Result<(), TransportError> {
         match self
             .routing_request(RoutingContextRequestOp::AppMessage {
-                target: Target::PrivateRoute(parse_route(target)?),
+                target: Target::RouteId(parse_route(target)?),
                 message: payload.to_vec(),
             })
             .await?

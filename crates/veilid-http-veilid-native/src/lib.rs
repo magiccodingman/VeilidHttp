@@ -221,7 +221,7 @@ impl VeilidTransport for NativeVeilidTransport {
         payload: Bytes,
     ) -> Result<Bytes, TransportError> {
         self.routing
-            .app_call(Target::PrivateRoute(parse_route(target)?), payload.to_vec())
+            .app_call(Target::RouteId(parse_route(target)?), payload.to_vec())
             .await
             .map(Bytes::from)
             .map_err(classify_error)
@@ -233,7 +233,7 @@ impl VeilidTransport for NativeVeilidTransport {
         payload: Bytes,
     ) -> Result<(), TransportError> {
         self.routing
-            .app_message(Target::PrivateRoute(parse_route(target)?), payload.to_vec())
+            .app_message(Target::RouteId(parse_route(target)?), payload.to_vec())
             .await
             .map_err(classify_error)
     }
