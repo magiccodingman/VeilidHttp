@@ -1,7 +1,7 @@
 //! Bounded binary IPC framing between Electron and the trusted Rust sidecar.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -33,7 +33,7 @@ pub enum FrameKind {
     Cancel = 6,
     /// Asynchronous sidecar event.
     Event = 7,
-    /// Add per-request response-stream delivery credits.
+    /// Add per-request stream delivery credits.
     StreamCredit = 8,
 }
 
@@ -172,8 +172,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<IpcFrame
     }
     let mut metadata = vec![0_u8; metadata_len];
     let mut payload = vec![0_u8; payload_len];
-    reader.read_exact(&mut metadata).await.map_err(IpcError::Io)?;
-    reader.read_exact(&mut payload).await.map_err(IpcError::Io)?;
+    reader
+        .read_exact(&mut metadata)
+        .await
+        .map_err(IpcError::Io)?;
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(IpcError::Io)?;
     Ok(IpcFrame {
         kind,
         flags,
@@ -192,7 +198,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &IpcFrame,
 ) -> Result<(), IpcError> {
-    writer.write_all(&frame.encode()?).await.map_err(IpcError::Io)?;
+    writer
+        .write_all(&frame.encode()?)
+        .await
+        .map_err(IpcError::Io)?;
     writer.flush().await.map_err(IpcError::Io)
 }
 
@@ -203,9 +212,21 @@ pub struct Hello {
     pub secret: String,
 }
 
+/// Which logical IPC body direction receives additional capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpcStreamDirection {
+    /// Electron may send more HTTP request-body chunks to Rust.
+    Request,
+    /// Rust may send more HTTP response-body chunks to Electron.
+    Response,
+}
+
 /// Per-request stream delivery credit update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCredit {
+    /// Body direction whose capacity is being increased.
+    pub direction: IpcStreamDirection,
     /// Additional body chunks the receiver is ready to accept.
     pub credits: u32,
 }
@@ -266,7 +287,9 @@ mod tests {
         let expected = IpcFrame::from_metadata(
             FrameKind::Request,
             42,
-            &Hello { secret: "secret".to_owned() },
+            &Hello {
+                secret: "secret".to_owned(),
+            },
             Bytes::from_static(b"body"),
         )
         .unwrap();
@@ -275,18 +298,58 @@ mod tests {
         let received = read_frame(&mut server).await.unwrap();
         writer.await.unwrap();
         assert_eq!(received, expected);
-        assert_eq!(received.decode_metadata::<Hello>().unwrap().secret, "secret");
+        assert_eq!(
+            received.decode_metadata::<Hello>().unwrap().secret,
+            "secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn directional_stream_credit_round_trips() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let credit = StreamCredit {
+            direction: IpcStreamDirection::Response,
+            credits: 4,
+        };
+        let expected = IpcFrame::from_metadata(
+            FrameKind::StreamCredit,
+            73,
+            &credit,
+            Bytes::new(),
+        )
+        .unwrap();
+        let sent = expected.clone();
+        let writer = tokio::spawn(async move { write_frame(&mut client, &sent).await.unwrap() });
+        let received = read_frame(&mut server).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(received.decode_metadata::<StreamCredit>().unwrap(), credit);
     }
 
     #[test]
     fn stream_credit_is_bounded() {
-        assert!(StreamCredit { credits: 1 }.validate().is_ok());
+        assert!(
+            StreamCredit {
+                direction: IpcStreamDirection::Request,
+                credits: 1,
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(matches!(
-            StreamCredit { credits: 0 }.validate(),
+            StreamCredit {
+                direction: IpcStreamDirection::Request,
+                credits: 0,
+            }
+            .validate(),
             Err(IpcError::InvalidStreamCredits(0))
         ));
         assert!(matches!(
-            StreamCredit { credits: MAX_STREAM_CREDITS + 1 }.validate(),
+            StreamCredit {
+                direction: IpcStreamDirection::Response,
+                credits: MAX_STREAM_CREDITS + 1,
+            }
+            .validate(),
             Err(IpcError::InvalidStreamCredits(_))
         ));
     }
