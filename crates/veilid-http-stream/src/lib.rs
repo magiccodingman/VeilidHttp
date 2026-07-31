@@ -151,19 +151,27 @@ pub struct StreamError {
 pub enum DecodedFrame {
     /// Stream-capable request opening.
     RequestOpen {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Decoded request opening metadata.
         value: RequestOpen,
+        /// Optional initial encoded body bytes carried by the opening frame.
         initial_payload: Bytes,
     },
     /// Server accepted a streamed request body.
     RequestAccepted {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Server acceptance and negotiated receive-window metadata.
         value: RequestAccepted,
     },
     /// Streamed response opening.
     ResponseOpen {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Decoded response opening metadata.
         value: ResponseOpen,
+        /// Optional initial encoded response-body bytes.
         initial_payload: Bytes,
     },
     /// Request or response compressed data frame.
@@ -179,23 +187,32 @@ pub enum DecodedFrame {
     },
     /// Final stream integrity frame.
     End {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Sequence number immediately following the final data frame.
         sequence: u32,
+        /// Final length, digest, and direction metadata.
         value: StreamEnd,
     },
     /// Selective acknowledgement.
     Ack {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Cumulative and selective acknowledgement metadata.
         value: Ack,
     },
     /// Cancellation.
     Cancel {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Cancellation reason metadata.
         value: Cancel,
     },
     /// Structured error.
     Error {
+        /// Transaction identifier.
         transaction_id: [u8; 16],
+        /// Structured protocol or upstream error metadata.
         value: StreamError,
     },
     /// Frame not owned by the streaming layer.
@@ -225,7 +242,12 @@ pub enum StreamProtocolError {
     DigestMismatch,
     /// Logical stream exceeded its configured receiver bound.
     #[error("logical stream bytes {actual} exceed limit {limit}")]
-    LogicalLimit { actual: u64, limit: u64 },
+    LogicalLimit {
+        /// Logical bytes observed or declared.
+        actual: u64,
+        /// Configured maximum logical bytes.
+        limit: u64,
+    },
     /// Frame direction and frame type conflict.
     #[error("stream direction does not match frame type")]
     DirectionMismatch,
