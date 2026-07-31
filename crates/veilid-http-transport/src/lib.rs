@@ -68,17 +68,11 @@ pub trait VeilidTransport: Send + Sync {
     /// Release a locally allocated or remotely imported private route.
     async fn release_route(&self, target: &RouteTarget) -> Result<(), TransportError>;
     /// Send an AppCall and await its application reply.
-    async fn app_call(
-        &self,
-        target: &RouteTarget,
-        payload: Bytes,
-    ) -> Result<Bytes, TransportError>;
+    async fn app_call(&self, target: &RouteTarget, payload: Bytes)
+    -> Result<Bytes, TransportError>;
     /// Dispatch a one-way AppMessage.
-    async fn app_message(
-        &self,
-        target: &RouteTarget,
-        payload: Bytes,
-    ) -> Result<(), TransportError>;
+    async fn app_message(&self, target: &RouteTarget, payload: Bytes)
+    -> Result<(), TransportError>;
     /// Reply exactly once to an inbound AppCall.
     async fn app_call_reply(&self, call_id: &str, payload: Bytes) -> Result<(), TransportError>;
     /// Receive the next adapter event.
