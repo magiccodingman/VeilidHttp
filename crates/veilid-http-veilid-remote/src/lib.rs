@@ -379,9 +379,9 @@ impl VeilidTransport for RemoteVeilidTransport {
             })
             .await?
         {
-            ResponseOp::ImportRemotePrivateRoute { result } => Ok(RouteTarget(
-                unwrap_string_result!(result)?.to_string(),
-            )),
+            ResponseOp::ImportRemotePrivateRoute { result } => {
+                Ok(RouteTarget(unwrap_string_result!(result)?.to_string()))
+            }
             _ => Err(TransportError::Fatal(
                 "unexpected import-route response".to_owned(),
             )),
