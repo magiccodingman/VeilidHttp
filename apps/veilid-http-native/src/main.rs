@@ -18,7 +18,9 @@ use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
 use veilid_http_http::{HeaderField, RequestHead};
-use veilid_http_ipc::{FrameKind, Hello, IpcFrame, read_frame, write_frame};
+use veilid_http_ipc::{
+    FrameKind, Hello, IpcFrame, MAX_STREAM_CREDITS, StreamCredit, read_frame, write_frame,
+};
 use veilid_http_transport::RouteTarget;
 use veilid_http_veilid_native::{NativeTransportConfig, NativeVeilidTransport};
 
@@ -94,6 +96,7 @@ struct State {
 #[derive(Debug)]
 struct ActiveRequest {
     request_body: Option<mpsc::Sender<Bytes>>,
+    response_credits: Arc<Semaphore>,
     cancel: watch::Sender<bool>,
     _permit: OwnedSemaphorePermit,
 }
@@ -174,6 +177,7 @@ impl State {
                         "vhttp-atomic",
                         "vhttp-streaming",
                         "streaming-binary-ipc",
+                        "per-stream-ipc-flow-control",
                     ],
                 })?,
                 Bytes::new(),
@@ -258,10 +262,12 @@ async fn start_http_request(
     let cancel = request.cancellation_handle();
     let request_body = request.request_body;
     let mut responses = request.responses;
+    let response_credits = Arc::new(Semaphore::new(0));
     active.lock().await.insert(
         request_id,
         ActiveRequest {
             request_body,
+            response_credits: Arc::clone(&response_credits),
             cancel,
             _permit: permit,
         },
@@ -291,14 +297,24 @@ async fn start_http_request(
                     .await
                 }
                 ClientResponseEvent::Data(chunk) => {
-                    queue_response(
-                        &outbound,
-                        FrameKind::StreamData,
-                        request_id,
-                        &(),
-                        chunk,
-                    )
-                    .await
+                    let permit = Arc::clone(&response_credits)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("local response stream was cancelled"));
+                    match permit {
+                        Ok(permit) => {
+                            permit.forget();
+                            queue_response(
+                                &outbound,
+                                FrameKind::StreamData,
+                                request_id,
+                                &(),
+                                chunk,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 ClientResponseEvent::End => {
                     let result = queue_response(
@@ -339,6 +355,7 @@ async fn start_http_request(
                 break;
             }
         }
+        response_credits.close();
         if let Some(active_request) = active.lock().await.remove(&request_id) {
             let _ = active_request.cancel.send(true);
         }
@@ -521,8 +538,61 @@ where
                     }
                 }
             }
+            FrameKind::StreamCredit => {
+                let credit = match frame
+                    .decode_metadata::<StreamCredit>()
+                    .and_then(StreamCredit::validate)
+                {
+                    Ok(credit) => credit,
+                    Err(error) => {
+                        queue_response(
+                            &outbound,
+                            FrameKind::Cancel,
+                            frame.request_id,
+                            &failure(error),
+                            Bytes::new(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let response_credits = active
+                    .lock()
+                    .await
+                    .get(&frame.request_id)
+                    .map(|request| Arc::clone(&request.response_credits));
+                let Some(response_credits) = response_credits else {
+                    queue_response(
+                        &outbound,
+                        FrameKind::Cancel,
+                        frame.request_id,
+                        &failure("no live response stream accepts this credit update"),
+                        Bytes::new(),
+                    )
+                    .await?;
+                    continue;
+                };
+                let credits = usize::try_from(credit.credits)
+                    .map_err(|_| anyhow::anyhow!("stream credit count does not fit usize"))?;
+                let maximum = usize::try_from(MAX_STREAM_CREDITS)
+                    .map_err(|_| anyhow::anyhow!("stream credit bound does not fit usize"))?;
+                if response_credits.available_permits().saturating_add(credits) > maximum {
+                    response_credits.close();
+                    queue_response(
+                        &outbound,
+                        FrameKind::Cancel,
+                        frame.request_id,
+                        &failure("response stream credit window exceeded"),
+                        Bytes::new(),
+                    )
+                    .await?;
+                    continue;
+                }
+                response_credits.add_permits(credits);
+            }
             FrameKind::Cancel => {
                 if let Some(request) = active.lock().await.remove(&frame.request_id) {
+                    request.response_credits.close();
                     let _ = request.cancel.send(true);
                 }
             }
@@ -540,6 +610,7 @@ where
     }
 
     for (_, request) in active.lock().await.drain() {
+        request.response_credits.close();
         let _ = request.cancel.send(true);
     }
     drop(outbound);
