@@ -2,14 +2,13 @@ import {
   app,
   BrowserWindow,
   ipcMain,
-  protocol,
   session,
   WebContentsView,
   type Session,
 } from 'electron';
 import { Sidecar } from './sidecar';
 import path from 'node:path';
-import { isSiteId, routeOrigin } from '../shared/site-id';
+import { isSiteId, routeOrigin, siteIdFromHostname } from '../shared/site-id';
 import { findLaunchTarget } from './launch-target';
 
 declare const SHELL_WEBPACK_ENTRY: string;
@@ -17,21 +16,6 @@ declare const SHELL_PRELOAD_WEBPACK_ENTRY: string;
 
 const SHELL_HEIGHT = 132;
 const registeredSessions = new WeakSet<Session>();
-
-protocol.registerSchemesAsPrivileged([
-  {
-    scheme: 'veilid',
-    privileges: {
-      standard: true,
-      secure: true,
-      supportFetchAPI: true,
-      corsEnabled: true,
-      allowServiceWorkers: true,
-      stream: true,
-      codeCache: true,
-    },
-  },
-]);
 
 const sidecar = new Sidecar();
 let shellWindow: BrowserWindow | undefined;
@@ -50,16 +34,25 @@ function registerSiteProtocol(targetSession: Session): void {
   if (registeredSessions.has(targetSession)) return;
   registeredSessions.add(targetSession);
 
-  targetSession.protocol.handle('veilid', async (request) => {
+  targetSession.protocol.handle('http', async (request) => {
     const url = new URL(request.url);
-    if (!isSiteId(url.hostname)) return new Response('Invalid Veilid route identifier', { status: 400 });
+    const siteId = siteIdFromHostname(url.hostname);
+    if (!siteId) {
+      return new Response('Plain HTTP outside VeilidHttp localhost origins is blocked', {
+        status: 403,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
 
     try {
       const response = await sidecar.streamRequest<{
         status: number;
         headers: Array<[string, string]>;
       }>('httpRequest', {
-        siteId: url.hostname,
+        siteId,
         method: request.method,
         pathAndQuery: `${url.pathname}${url.search}`,
         headers: [...request.headers.entries()],
@@ -103,7 +96,9 @@ async function openSite(siteId: string, startPath = '/'): Promise<void> {
   siteView.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   siteView.webContents.on('will-navigate', (event, navigationUrl) => {
     const destination = new URL(navigationUrl);
-    if (!['veilid:', 'https:'].includes(destination.protocol)) event.preventDefault();
+    const allowedVeilidOrigin = destination.protocol === 'http:'
+      && siteIdFromHostname(destination.hostname) !== undefined;
+    if (!allowedVeilidOrigin && destination.protocol !== 'https:') event.preventDefault();
   });
   shellWindow.contentView.addChildView(siteView);
   resizeSiteView();
@@ -166,7 +161,6 @@ ipcMain.handle('veilid-http:close-site', () => {
 
 app.whenReady().then(async () => {
   await sidecar.start();
-  registerSiteProtocol(session.defaultSession);
   await createShell();
   const target = findLaunchTarget(process.argv.slice(1), path.dirname(process.execPath));
   if (target) {
