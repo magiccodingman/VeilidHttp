@@ -62,6 +62,7 @@ impl OutboundBody {
     /// # Errors
     ///
     /// Returns an error for an invalid frame window/buffer bound or compression setup.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transaction_id: [u8; 16],
         direction: StreamDirection,
@@ -136,10 +137,8 @@ impl OutboundBody {
             .ok_or(EngineError::AlreadyFinished)?
             .push(logical, flush)?;
         self.queue_compressed(&encoded)?;
-        if flush {
-            if let Some(payload) = self.batcher.flush() {
-                self.queue(PendingItem::Data(payload))?;
-            }
+        if flush && let Some(payload) = self.batcher.flush() {
+            self.queue(PendingItem::Data(payload))?;
         }
         self.pump()
     }
