@@ -80,8 +80,7 @@ impl OutboundBody {
         let minimum_window_bytes = conservative_frame_bytes
             .checked_mul(window_frames)
             .ok_or(EngineError::InvalidPendingBound(max_pending_bytes))?;
-        if max_pending_bytes < minimum_window_bytes
-            || max_pending_bytes < batcher.target_payload()
+        if max_pending_bytes < minimum_window_bytes || max_pending_bytes < batcher.target_payload()
         {
             return Err(EngineError::InvalidPendingBound(max_pending_bytes));
         }
@@ -171,8 +170,8 @@ impl OutboundBody {
     ///
     /// Returns an error for a peer window greater than 64 or framing/sequence failure.
     pub fn set_peer_window(&mut self, receive_window: u32) -> Result<(), EngineError> {
-        let receive_window = usize::try_from(receive_window)
-            .map_err(|_| EngineError::InvalidWindow(usize::MAX))?;
+        let receive_window =
+            usize::try_from(receive_window).map_err(|_| EngineError::InvalidWindow(usize::MAX))?;
         if receive_window > 64 {
             return Err(EngineError::InvalidWindow(receive_window));
         }
@@ -213,11 +212,7 @@ impl OutboundBody {
 
     /// Return never-sent or expired retained frames and mark this dispatch attempt.
     #[must_use]
-    pub fn take_sendable(
-        &mut self,
-        now_ms: u64,
-        retry_policy: RetryPolicy,
-    ) -> Vec<RetainedFrame> {
+    pub fn take_sendable(&mut self, now_ms: u64, retry_policy: RetryPolicy) -> Vec<RetainedFrame> {
         let sequences = self
             .in_flight
             .iter()
@@ -302,9 +297,12 @@ impl OutboundBody {
             };
             let sequence = self.next_sequence;
             let encoded = match &item {
-                PendingItem::Data(payload) => {
-                    encode_data(self.transaction_id, self.direction, sequence, payload.clone())?
-                }
+                PendingItem::Data(payload) => encode_data(
+                    self.transaction_id,
+                    self.direction,
+                    sequence,
+                    payload.clone(),
+                )?,
                 PendingItem::End(end) => encode_end(self.transaction_id, sequence, end)?,
             };
             let projected = self

@@ -161,11 +161,7 @@ impl CompletionStore {
                 }
             }
         }
-        trim_loaded_entries(
-            &directory,
-            &mut entries,
-            max_completed_entries.max(1),
-        );
+        trim_loaded_entries(&directory, &mut entries, max_completed_entries.max(1));
         Ok(Arc::new(Self {
             directory,
             retention,
@@ -365,8 +361,7 @@ impl CompletionStore {
     }
 
     fn file_path(&self, id: [u8; 16]) -> PathBuf {
-        self.directory
-            .join(format!("{}.json", hex_transaction(id)))
+        self.directory.join(format!("{}.json", hex_transaction(id)))
     }
 }
 
@@ -485,26 +480,16 @@ mod tests {
         let directory = temporary_directory("reopen");
         let _ = fs::remove_dir_all(&directory);
         let id = [7_u8; 16];
-        let store = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
+        let store =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         store
             .record(id, Some(Bytes::from_static(b"response")))
             .await
             .unwrap();
         drop(store);
-        let reopened = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
+        let reopened =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(
             reopened.lookup(id).await,
             Some(CompletionLookup::Response(ref bytes)) if bytes.as_ref() == b"response"
@@ -517,25 +502,22 @@ mod tests {
         let directory = temporary_directory("inflight-restart");
         let _ = fs::remove_dir_all(&directory);
         let id = [8_u8; 16];
-        let store = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
+        let store =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
-        assert!(directory.join(format!("{}.json", hex_transaction(id))).is_file());
+        assert!(
+            directory
+                .join(format!("{}.json", hex_transaction(id)))
+                .is_file()
+        );
         drop(store);
 
-        let reopened = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
-        assert!(matches!(reopened.claim(id).await, CompletionClaim::Tombstone));
+        let reopened =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
+        assert!(matches!(
+            reopened.claim(id).await,
+            CompletionClaim::Tombstone
+        ));
         assert!(matches!(
             reopened.lookup(id).await,
             Some(CompletionLookup::Tombstone)
@@ -548,13 +530,8 @@ mod tests {
         let directory = temporary_directory("abandon");
         let _ = fs::remove_dir_all(&directory);
         let id = [6_u8; 16];
-        let store = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
+        let store =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         store.abandon(id).await;
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
@@ -566,13 +543,8 @@ mod tests {
         let directory = temporary_directory("tombstone");
         let _ = fs::remove_dir_all(&directory);
         let id = [9_u8; 16];
-        let store = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            4,
-            16,
-        )
-        .unwrap();
+        let store =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 4, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         store
             .record(id, Some(Bytes::from_static(b"too-large")))
@@ -597,7 +569,10 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(matches!(store.claim([1; 16]).await, CompletionClaim::Execute));
+        assert!(matches!(
+            store.claim([1; 16]).await,
+            CompletionClaim::Execute
+        ));
         let waiting = match store.claim([2; 16]).await {
             CompletionClaim::Wait(notify) => notify,
             other => panic!("expected capacity wait, got {other:?}"),
@@ -606,7 +581,10 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), waiting.notified())
             .await
             .expect("stored capacity wake permit");
-        assert!(matches!(store.claim([2; 16]).await, CompletionClaim::Execute));
+        assert!(matches!(
+            store.claim([2; 16]).await,
+            CompletionClaim::Execute
+        ));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -615,13 +593,8 @@ mod tests {
         let directory = temporary_directory("duplicate-wakeup");
         let _ = fs::remove_dir_all(&directory);
         let id = [3_u8; 16];
-        let store = CompletionStore::open(
-            directory.clone(),
-            Duration::from_secs(60),
-            1024,
-            16,
-        )
-        .unwrap();
+        let store =
+            CompletionStore::open(directory.clone(), Duration::from_secs(60), 1024, 16).unwrap();
         assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         let waiting = match store.claim(id).await {
             CompletionClaim::Wait(notify) => notify,

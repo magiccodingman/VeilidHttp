@@ -272,11 +272,13 @@ impl Frame {
             });
         }
 
-        let metadata_len = u16::try_from(metadata.len()).map_err(|_| WireError::MetadataTooLarge(metadata.len()))?;
-        let payload_len = u32::try_from(self.payload.len()).map_err(|_| WireError::FrameTooLarge {
-            actual: total,
-            limit,
-        })?;
+        let metadata_len = u16::try_from(metadata.len())
+            .map_err(|_| WireError::MetadataTooLarge(metadata.len()))?;
+        let payload_len =
+            u32::try_from(self.payload.len()).map_err(|_| WireError::FrameTooLarge {
+                actual: total,
+                limit,
+            })?;
         let mut output = BytesMut::with_capacity(total);
         output.put_slice(&MAGIC);
         output.put_u8(VERSION);

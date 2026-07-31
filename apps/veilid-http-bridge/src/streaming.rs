@@ -20,9 +20,8 @@ use veilid_http_http::{
     upstream_url,
 };
 use veilid_http_stream::{
-    CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen,
-    StreamDirection, StreamError, decode, encode_ack, encode_error, encode_request_accepted,
-    encode_response_open,
+    CompressionMode, DecodedFrame, RequestAccepted, RequestOpen, ResponseOpen, StreamDirection,
+    StreamError, decode, encode_ack, encode_error, encode_request_accepted, encode_response_open,
 };
 use veilid_http_transport::{RouteTarget, VeilidTransport};
 use veilid_http_wire::{Frame, FrameBundle, VEILID_MESSAGE_LIMIT};
@@ -188,7 +187,9 @@ impl StreamingBridge {
                 initial_payload,
             } => {
                 if !initial_payload.is_empty() {
-                    bail!("stream RequestOpen initial payload is reserved until sequenced initial-data support is enabled");
+                    bail!(
+                        "stream RequestOpen initial payload is reserved until sequenced initial-data support is enabled"
+                    );
                 }
                 (transaction_id, value)
             }
@@ -225,7 +226,8 @@ impl StreamingBridge {
                     transaction_id,
                     &StreamError {
                         code: "transaction-already-completed".to_owned(),
-                        message: "transaction already completed and will not be forwarded again".to_owned(),
+                        message: "transaction already completed and will not be forwarded again"
+                            .to_owned(),
                         retryable: false,
                     },
                 )?;
@@ -342,11 +344,7 @@ impl StreamingBridge {
         });
         *transaction.task.lock().await = Some(task);
 
-        if let Err(error) = self
-            .transport
-            .app_call_reply(call_id, accepted_reply)
-            .await
-        {
+        if let Err(error) = self.transport.app_call_reply(call_id, accepted_reply).await {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
             }
@@ -390,7 +388,9 @@ impl StreamingBridge {
                         .lock()
                         .await
                         .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("transaction does not accept a request body"))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("transaction does not accept a request body")
+                        })?
                         .receive(encoded)?;
                     for chunk in output.logical_chunks {
                         let sender = transaction.upstream_body.lock().await.clone();
@@ -405,9 +405,8 @@ impl StreamingBridge {
                     if output.completed {
                         transaction.upstream_body.lock().await.take();
                     }
-                    let should_ack = output.completed
-                        || output.ack.selective != 0
-                        || sequence & 3 == 3;
+                    let should_ack =
+                        output.completed || output.ack.selective != 0 || sequence & 3 == 3;
                     if should_ack {
                         pending_acks
                             .entry(transaction.return_target.clone())
@@ -426,9 +425,11 @@ impl StreamingBridge {
                         opening.acknowledged = true;
                     }
                     let mut sender = transaction.response_sender.lock().await;
-                    let outbound = sender
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("response ACK arrived before response sender initialization"))?;
+                    let outbound = sender.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "response ACK arrived before response sender initialization"
+                        )
+                    })?;
                     outbound.acknowledge(value)?;
                     drop(sender);
                     transaction.response_notify.notify_waiters();
@@ -466,12 +467,7 @@ impl StreamingBridge {
 
     /// Abort every active transaction, used when the server receiving route dies.
     pub async fn cancel_all(&self) {
-        let transactions = self
-            .transactions
-            .lock()
-            .await
-            .drain()
-            .collect::<Vec<_>>();
+        let transactions = self.transactions.lock().await.drain().collect::<Vec<_>>();
         for (id, transaction) in transactions {
             if let Some(task) = transaction.task.lock().await.take() {
                 task.abort();
@@ -707,24 +703,17 @@ impl StreamingBridge {
             .context("send or retry response stream frames")
     }
 
-    async fn send_encoded_frames(
-        &self,
-        target: &RouteTarget,
-        frames: Vec<Bytes>,
-    ) -> Result<()> {
+    async fn send_encoded_frames(&self, target: &RouteTarget, frames: Vec<Bytes>) -> Result<()> {
         let mut bundle = Vec::new();
         let mut encoded_bytes = 8_usize;
         for frame in frames {
-            let projected = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            let projected = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             if !bundle.is_empty() && projected > VEILID_MESSAGE_LIMIT {
-                self.send_bundle(target, std::mem::take(&mut bundle)).await?;
+                self.send_bundle(target, std::mem::take(&mut bundle))
+                    .await?;
                 encoded_bytes = 8;
             }
-            encoded_bytes = encoded_bytes
-                .saturating_add(4)
-                .saturating_add(frame.len());
+            encoded_bytes = encoded_bytes.saturating_add(4).saturating_add(frame.len());
             bundle.push(frame);
         }
         if !bundle.is_empty() {
