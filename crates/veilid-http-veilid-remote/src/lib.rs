@@ -132,6 +132,7 @@ impl RemoteVeilidTransport {
         &self.server_version
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn from_stream<S>(stream: S, request_timeout: Duration) -> Result<Self, TransportError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -231,10 +232,10 @@ impl RemoteVeilidTransport {
         };
 
         if let ResponseOp::Attach { result } = client.request(RequestOp::Attach).await? {
-            if let Err(error) = unwrap_api_result!(result) {
-                if !error.to_string().to_ascii_lowercase().contains("already") {
-                    return Err(error);
-                }
+            if let Err(error) = unwrap_api_result!(result)
+                && !error.to_string().to_ascii_lowercase().contains("already")
+            {
+                return Err(error);
             }
         } else {
             return Err(TransportError::Fatal(
