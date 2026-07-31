@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,7 +24,8 @@ pub enum CompletionClaim {
     Execute,
     /// A retained response can be replayed without forwarding upstream again.
     Replay(Bytes),
-    /// The transaction completed but its response was intentionally not retained.
+    /// The transaction completed, may have completed before a crash, or could not be
+    /// durably claimed. It must not be automatically forwarded again.
     Tombstone,
     /// Another execution or the global capacity bound must change before retrying.
     Wait(Arc<Notify>),
@@ -34,7 +36,7 @@ pub enum CompletionClaim {
 pub enum CompletionLookup {
     /// A complete response was retained.
     Response(Bytes),
-    /// The request completed but no response body is retained.
+    /// The request completed or its result became indeterminate across a restart.
     Tombstone,
     /// The transaction is currently executing through another request mode.
     InFlight,
@@ -56,6 +58,11 @@ struct PersistedCompletion {
     transaction_id: String,
     expires_at_unix_seconds: u64,
     response_base64: Option<String>,
+    /// A durable pre-execution claim. After a process restart this is treated as an
+    /// indeterminate tombstone: the upstream may or may not have executed it, so the
+    /// bridge must never forward the same transaction identifier automatically.
+    #[serde(default)]
+    in_flight: bool,
 }
 
 /// Bounded persistent completion store shared by atomic and streamed bridge paths.
@@ -122,14 +129,26 @@ impl CompletionStore {
                 continue;
             }
             match load_entry(&path) {
-                Ok((id, response, expires_at)) if expires_at > now => {
+                Ok((id, response, expires_at, in_flight)) if expires_at > now => {
+                    let response = if in_flight { None } else { response };
                     entries.insert(
                         id,
                         Entry::Complete {
-                            response,
+                            response: response.clone(),
                             expires_at_unix_seconds: expires_at,
                         },
                     );
+                    if in_flight {
+                        if let Err(error) =
+                            persist_entry(&directory, id, response.as_ref(), expires_at, false)
+                        {
+                            tracing::warn!(
+                                %error,
+                                path = %path.display(),
+                                "could not normalize recovered in-flight claim to tombstone"
+                            );
+                        }
+                    }
                 }
                 Ok(_) => {
                     let _ = fs::remove_file(&path);
@@ -156,6 +175,10 @@ impl CompletionStore {
     }
 
     /// Claim a transaction for execution, replay, or waiting.
+    ///
+    /// A new claim is written to durable storage before `Execute` is returned. If that
+    /// write fails, the transaction becomes an in-memory tombstone and is not forwarded.
+    /// This deliberately prefers zero executions over the possibility of two.
     pub async fn claim(&self, id: [u8; 16]) -> CompletionClaim {
         let mut entries = self.entries.lock().await;
         self.prune_locked(&mut entries);
@@ -174,6 +197,35 @@ impl CompletionStore {
                 if active >= self.max_in_flight {
                     return CompletionClaim::Wait(Arc::clone(&self.capacity_notify));
                 }
+
+                let expires_at = match now_unix_seconds() {
+                    Ok(now) => now.saturating_add(self.retention.as_secs()),
+                    Err(error) => {
+                        tracing::error!(%error, transaction = %hex_transaction(id), "refused transaction because its durable claim timestamp could not be created");
+                        return CompletionClaim::Tombstone;
+                    }
+                };
+                if let Err(error) = persist_entry(&self.directory, id, None, expires_at, true) {
+                    tracing::error!(
+                        %error,
+                        transaction = %hex_transaction(id),
+                        "refused transaction because its pre-execution claim could not be persisted"
+                    );
+                    entries.insert(
+                        id,
+                        Entry::Complete {
+                            response: None,
+                            expires_at_unix_seconds: expires_at,
+                        },
+                    );
+                    let evicted = self.enforce_completed_limit_locked(&mut entries, id);
+                    drop(entries);
+                    for evicted_id in evicted {
+                        let _ = fs::remove_file(self.file_path(evicted_id));
+                    }
+                    return CompletionClaim::Tombstone;
+                }
+
                 entries.insert(id, Entry::InFlight(Arc::new(Notify::new())));
                 CompletionClaim::Execute
             }
@@ -197,11 +249,13 @@ impl CompletionStore {
     /// Record completion and wake duplicate/capacity waiters.
     ///
     /// Responses larger than the configured retention threshold become tombstones.
-    /// In-memory protection is established before disk persistence is attempted.
+    /// In-memory protection is established before disk persistence is attempted. If the
+    /// final write fails, the earlier durable in-flight claim remains and is recovered as
+    /// an indeterminate tombstone after restart.
     ///
     /// # Errors
     ///
-    /// Returns an error when the durable record cannot be written.
+    /// Returns an error when the durable completion record cannot be written.
     pub async fn record(&self, id: [u8; 16], response: Option<Bytes>) -> Result<()> {
         let response = response.filter(|bytes| bytes.len() <= self.max_response_bytes);
         let expires_at = now_unix_seconds()?.saturating_add(self.retention.as_secs());
@@ -221,11 +275,10 @@ impl CompletionStore {
         let evicted = self.enforce_completed_limit_locked(&mut entries, id);
         drop(entries);
         if let Some(notify) = notify {
-            // notify_one stores a permit when the duplicate has not begun waiting yet.
             notify.notify_one();
         }
         self.capacity_notify.notify_one();
-        persist_entry(&self.directory, id, response.as_ref(), expires_at)?;
+        persist_entry(&self.directory, id, response.as_ref(), expires_at, false)?;
         for evicted_id in evicted {
             let _ = fs::remove_file(self.file_path(evicted_id));
         }
@@ -234,10 +287,28 @@ impl CompletionStore {
 
     /// Remove an in-flight claim when execution is known not to have reached the upstream.
     pub async fn abandon(&self, id: [u8; 16]) {
-        let notify = match self.entries.lock().await.remove(&id) {
-            Some(Entry::InFlight(notify)) => Some(notify),
-            _ => None,
+        let notify = {
+            let mut entries = self.entries.lock().await;
+            if matches!(entries.get(&id), Some(Entry::InFlight(_))) {
+                match entries.remove(&id) {
+                    Some(Entry::InFlight(notify)) => Some(notify),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         };
+        if notify.is_some() {
+            match fs::remove_file(self.file_path(id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    transaction = %hex_transaction(id),
+                    "could not remove abandoned durable transaction claim"
+                ),
+            }
+        }
         if let Some(notify) = notify {
             notify.notify_one();
         }
@@ -290,7 +361,8 @@ impl CompletionStore {
     }
 
     fn file_path(&self, id: [u8; 16]) -> PathBuf {
-        self.directory.join(format!("{}.json", hex_transaction(id)))
+        self.directory
+            .join(format!("{}.json", hex_transaction(id)))
     }
 }
 
@@ -331,12 +403,14 @@ fn persist_entry(
     id: [u8; 16],
     response: Option<&Bytes>,
     expires_at: u64,
+    in_flight: bool,
 ) -> Result<()> {
     let record = PersistedCompletion {
         schema: "org.veilidhttp.completed/v1".to_owned(),
         transaction_id: hex_transaction(id),
         expires_at_unix_seconds: expires_at,
         response_base64: response.map(|bytes| URL_SAFE_NO_PAD.encode(bytes)),
+        in_flight,
     };
     let destination = directory.join(format!("{}.json", record.transaction_id));
     let temporary = destination.with_extension("json.tmp");
@@ -347,7 +421,7 @@ fn persist_entry(
     Ok(())
 }
 
-fn load_entry(path: &Path) -> Result<([u8; 16], Option<Bytes>, u64)> {
+fn load_entry(path: &Path) -> Result<([u8; 16], Option<Bytes>, u64, bool)> {
     let record: PersistedCompletion = serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read completion record {}", path.display()))?,
     )?;
@@ -360,7 +434,12 @@ fn load_entry(path: &Path) -> Result<([u8; 16], Option<Bytes>, u64)> {
         .map(|value| URL_SAFE_NO_PAD.decode(value.as_bytes()).map(Bytes::from))
         .transpose()
         .context("decode retained atomic response")?;
-    Ok((id, response, record.expires_at_unix_seconds))
+    Ok((
+        id,
+        response,
+        record.expires_at_unix_seconds,
+        record.in_flight,
+    ))
 }
 
 fn now_unix_seconds() -> Result<u64> {
@@ -426,6 +505,55 @@ mod tests {
             reopened.lookup(id).await,
             Some(CompletionLookup::Response(ref bytes)) if bytes.as_ref() == b"response"
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_claim_becomes_tombstone_after_restart() {
+        let directory = temporary_directory("inflight-restart");
+        let _ = fs::remove_dir_all(&directory);
+        let id = [8_u8; 16];
+        let store = CompletionStore::open(
+            directory.clone(),
+            Duration::from_secs(60),
+            1024,
+            16,
+        )
+        .unwrap();
+        assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
+        assert!(directory.join(format!("{}.json", hex_transaction(id))).is_file());
+        drop(store);
+
+        let reopened = CompletionStore::open(
+            directory.clone(),
+            Duration::from_secs(60),
+            1024,
+            16,
+        )
+        .unwrap();
+        assert!(matches!(reopened.claim(id).await, CompletionClaim::Tombstone));
+        assert!(matches!(
+            reopened.lookup(id).await,
+            Some(CompletionLookup::Tombstone)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_claim_can_execute_again() {
+        let directory = temporary_directory("abandon");
+        let _ = fs::remove_dir_all(&directory);
+        let id = [6_u8; 16];
+        let store = CompletionStore::open(
+            directory.clone(),
+            Duration::from_secs(60),
+            1024,
+            16,
+        )
+        .unwrap();
+        assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
+        store.abandon(id).await;
+        assert!(matches!(store.claim(id).await, CompletionClaim::Execute));
         fs::remove_dir_all(directory).unwrap();
     }
 
